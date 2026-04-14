@@ -25,6 +25,12 @@ def StringToStringList(str):
 def StringListToString(str_list):
     return ".".join([word[0]+str(word[1]) for word in str_list])
 
+def _reverse_slices(string):
+    # Flip a tangle string between left-to-right and right-to-left slice order.
+    # Used to port tangles written before May 2020 (commit bf60719), when the
+    # convention was right-to-left, to the current left-to-right convention.
+    return ".".join(reversed(string.split(".")))
+
 class Tangle(object): #TODO: implement orientations for all methods
     """ A tangle is either a string that goes through all the slices, seperated by '.' or a list of slices
         'slices' is a string with the left most slice being the bottom of the tangle
@@ -148,6 +154,12 @@ class Tangle(object): #TODO: implement orientations for all methods
         return Tangle(tangle)
         
     @classmethod
+    def from_legacy(cls, string, **kwargs):
+        # Accept a tangle string written in the pre-May-2020 right-to-left
+        # slice convention and convert it to the current left-to-right one.
+        return cls(_reverse_slices(string), **kwargs)
+
+    @classmethod
     def LiamsTangle(cls, N, Twists):
         tangle = "cup1.neg0.pos2."
         for j in range(N):
@@ -159,8 +171,8 @@ class Tangle(object): #TODO: implement orientations for all methods
                     tangle += "pos2."
             tangle += "neg1.neg0."
         tangle += "pos2.cap3.neg0.neg0.cap1"
-        return Tangle(tangle)
-        
+        return Tangle(_reverse_slices(tangle))
+
     @classmethod
     def quotient_of_2_m3_pretzel_tangle(cls, N):
         tangle = "cup2.cup3.neg1.neg2.neg0.neg1.cup4.pos3.pos2.neg4.neg3.cap5.cap4.pos1.cup3.cup4.pos2.pos3.neg4.neg5.cap6."
@@ -170,8 +182,8 @@ class Tangle(object): #TODO: implement orientations for all methods
             if N < 0:
                 tangle += "neg3.neg4.neg0.neg3."
         tangle += "cap1.cap0.cap1"
-        return Tangle(tangle)
-    
+        return Tangle(_reverse_slices(tangle))
+
     @classmethod
     def two_twist_hitch(cls, m):
         tangle = "cup1.cup1.pos4.neg0.neg3.pos1.cap2."
@@ -181,7 +193,7 @@ class Tangle(object): #TODO: implement orientations for all methods
             if m < 0:
                 tangle += "neg1."
         tangle += "pos2.pos2.neg0.neg0.cap3.cap1"
-        return Tangle(tangle)
+        return Tangle(_reverse_slices(tangle))
 
     # ONLY USE THIS ON UNORIENTED TANGLES
     def OrientTangle(self, input_orientations):    

@@ -248,25 +248,31 @@ class mor(object):
         
         def partition_new_comps(new_comps,arcs):
             """The finest partition of new_comps such that the endpoints of any arc in arcs belong to the same subset. The output is a list of list of indices."""
+            # O(1) lookup: TEI -> index of its component in new_comps
+            tei_to_comp = {tei: ci for ci, comp in enumerate(new_comps) for tei in comp}
             partition=[]
-            # remaining components in our iteration
-            remaining=list(range(len(new_comps)))
-            while len(remaining)>0:
-                # pick the first of the remaining components as the nucleus of a new element of new_comps and remove from remaining
-                nucleus = [remaining.pop(0)]
-                # list of TEIs of nucleus
-                nucleusL = new_comps[nucleus[0]]
-                # find all TEIs of nucleus which arcs connects to a different component (which has to be in the set of remaining components)
-                joins = [i for i in nucleusL if arcs[i] not in nucleusL]
-                while len(joins)>0:
-                    # for the first element of joins, find the component and remove it from the remaining components (strictly reducing len(remaining))
-                    new=remaining.pop(find_first_index(remaining,lambda s: arcs[joins[0]] in new_comps[s]))
-                    # add this component to the nucleus of the new element of new_comps 
-                    nucleus.append(new) 
-                    # record the TEIs of the component
-                    nucleusL=nucleusL+new_comps[new]
-                    # add the new TEIs to joins if arcs sends them outside the nucleus
-                    joins=[i for i in joins if arcs[i] not in nucleusL]
+            remaining=set(range(len(new_comps)))
+            remaining_order=list(range(len(new_comps)))
+            ri = 0
+            while remaining:
+                # pick the first still-remaining component as the nucleus of a new partition element
+                while remaining_order[ri] not in remaining:
+                    ri += 1
+                seed = remaining_order[ri]
+                remaining.discard(seed)
+                nucleus = [seed]
+                nucleusL = list(new_comps[seed])
+                nucleusL_set = set(nucleusL)
+                # TEIs of the nucleus whose arc-partner lives in a different component
+                joins = [i for i in nucleusL if arcs[i] not in nucleusL_set]
+                while joins:
+                    new = tei_to_comp[arcs[joins[0]]]
+                    remaining.discard(new)
+                    nucleus.append(new)
+                    added = new_comps[new]
+                    nucleusL.extend(added)
+                    nucleusL_set.update(added)
+                    joins = [i for i in joins if arcs[i] not in nucleusL_set]
                 partition.append(nucleus)
             return partition
         
@@ -284,10 +290,18 @@ class mor(object):
         old_comps_x=partition_new_comps(new_comps,self.back.arcs)
         # list of lists of TEIs that belong to the same component before neck-cuttting
         old_comps=[flatten([new_comps[index] for index in old_comp_x]) for old_comp_x in old_comps_x]
-        # list of lists of indices of components in first/second cobordism that belong to the old_comp in old_comps
-        comps1_x=[[j for j,comp in enumerate(comps1) if comp[0] in old_comp] for old_comp in old_comps]
-        # list of lists of indices of components in first/second cobordism that belong to the old_comp in old_comps
-        comps2_x=[[j for j,comp in enumerate(comps2) if comp[0] in old_comp] for old_comp in old_comps]
+        # TEI -> old_comp index.  Built once so comps1/comps2 membership is O(1).
+        tei_to_old = {tei: oi for oi, old_comp in enumerate(old_comps) for tei in old_comp}
+        comps1_x = [[] for _ in old_comps]
+        for j, comp in enumerate(comps1):
+            oi = tei_to_old.get(comp[0])
+            if oi is not None:
+                comps1_x[oi].append(j)
+        comps2_x = [[] for _ in old_comps]
+        for j, comp in enumerate(comps2):
+            oi = tei_to_old.get(comp[0])
+            if oi is not None:
+                comps2_x[oi].append(j)
          
         genus=[1-(len(comp1_x)\
                   +len(comp2_x)\
