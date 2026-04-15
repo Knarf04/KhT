@@ -198,12 +198,74 @@ class CobComplex(object):
                         self._nnz.discard((i, j))
 
     def eliminateAll(self): #mutates self by eliminating isomorphisms as long as it can find one
+        """Batched variant.  Each iso's rank-1 update is applied immediately,
+        but the expensive row/col deletion (full matrix reallocation via
+        np.delete) is deferred until the end.  Isomorphism positions in
+        already-scheduled-for-deletion rows/cols are skipped by findIsom.
+        """
+        deleted = set()
         while True:
-            index_to_eliminate = self.findIsom()
-            if index_to_eliminate is None:
+            # Find the next iso, ignoring positions involving deleted rows/cols.
+            found = None
+            for (ti, si) in self._nnz:
+                if ti in deleted or si in deleted:
+                    continue
+                if self.diff[ti, si].isIsom():
+                    found = (si, ti)
+                    break
+            if found is None:
                 break
-            else:
-                self.eliminateIsom(index_to_eliminate[0], index_to_eliminate[1])
+            si, ti = found
+            Min = si if si < ti else ti
+            Max = si if si > ti else ti
+            flip_sign = self.diff[ti, si].decos[0][-1] == 1
+
+            # Collect sparse in_target / out_source, skipping deleted
+            # indices and the pivot's own row/col.
+            out_source_col = self.diff[:, si]
+            in_target_row  = self.diff[ti]
+            nonzero_out = [(i, v) for i, v in enumerate(out_source_col)
+                           if v != 0 and i != si and i != ti and i not in deleted]
+            nonzero_in = [(j, -v if flip_sign else v) for j, v in enumerate(in_target_row)
+                          if v != 0 and j != si and j != ti and j not in deleted]
+
+            # Mark for deletion and prune _nnz of entries that touch them.
+            deleted.add(Min); deleted.add(Max)
+            if nonzero_out and nonzero_in:
+                # Sparse rank-1 update:  diff[i, j] += in_target[j] * out_source[i]
+                for i, ov in nonzero_out:
+                    for j, iv in nonzero_in:
+                        delta = iv * ov
+                        if delta == 0:
+                            continue
+                        cur = self.diff[i, j]
+                        if cur == 0:
+                            self.diff[i, j] = delta
+                            self._nnz.add((i, j))
+                        else:
+                            new = cur + delta
+                            self.diff[i, j] = new
+                            if new == 0:
+                                self._nnz.discard((i, j))
+            # Drop pivot row/col entries from _nnz so the next findIsom skip
+            # list stays accurate.
+            self._nnz = {(i, j) for (i, j) in self._nnz
+                         if i != Min and i != Max and j != Min and j != Max}
+
+        # Compact: drop all deleted rows/cols in one numpy allocation.
+        if deleted:
+            N = self.diff.shape[0]
+            keep_mask = np.ones(N, dtype=bool)
+            for k in deleted:
+                keep_mask[k] = False
+            self.diff = self.diff[keep_mask][:, keep_mask]
+            self.gens = [g for i, g in enumerate(self.gens) if i not in deleted]
+            # Remap _nnz indices to the compacted matrix
+            deleted_sorted = sorted(deleted)
+            import bisect
+            def shift(k):
+                return k - bisect.bisect_left(deleted_sorted, k)
+            self._nnz = {(shift(i), shift(j)) for (i, j) in self._nnz}
     
     def shift_qhd(self,q,h,delta):
         self.gens=[clt.shift_qhd(q,h,delta) for clt in self.gens]
@@ -247,27 +309,25 @@ def AddCap(Complex, i, grshift = "false"):
         If grshift is set to "true", then it applies a grading shift to every tangle (as above)
         Furthermore, it will flip the sign on every cobordism, which is the convention used so that the differential will square to 0 when adding a crossing"""
     Newgens = [AddCapToCLT(clt, i, grshift) for clt in Complex.gens]
-    length = len(Complex.gens)
-    Newdiff = []
-    for target ,row in enumerate(Complex.diff):
-        NewRow=[]
-        for source, cob in enumerate(row):
-            if cob == 0: #adding a cap to the zero cobordism does nothing
-                NewRow.append(0)
-            else: #not the zero cobordism
-                def incrementby2(j):
-                    if  j >= cob.front.top+i: #increment TEI by 2 if greater than where cap is to be inserted
-                        return j+2
-                    else:
-                        return j
-                newcomps=[[incrementby2(x) for x in comp] for comp in cob.comps] + [[cob.front.top +i, cob.front.top+i+1]] #shifts TEI of old components, and adds new component to the end of the list
-                if grshift == "true":
-                    newDecos = [ NewDeco[:-1] + [0] + [NewDeco[-1]*-1] for NewDeco in cob.decos] #adds the new component without a dot and flips the sign on the coefficient
-                else: 
-                    newDecos = [ NewDeco[:-1] + [0] + NewDeco[-1:] for NewDeco in cob.decos] #adds the new component without a dot
-                NewCob = Cob.mor(Newgens[source], Newgens[target], Cob.simplify_decos(newDecos), newcomps)
-                NewRow.append(NewCob.ReduceDecorations())
-        Newdiff.append(NewRow)
+    N = len(Complex.gens)
+    # Sparse construction: pre-allocate a zero-filled matrix and only touch
+    # the non-zero cells.  On big slices most of the N*N entries are 0, so
+    # skipping the Python-level cell loop saves meaningful time.
+    Newdiff = np.zeros((N, N), dtype=object)
+    for target, source in Complex._nnz:
+        cob = Complex.diff[target, source]
+        top_plus_i = cob.front.top + i
+        def incrementby2(j, _base=top_plus_i):
+            return j + 2 if j >= _base else j
+        newcomps = [[incrementby2(x) for x in comp] for comp in cob.comps] + [[top_plus_i, top_plus_i + 1]]
+        if grshift == "true":
+            newDecos = [NewDeco[:-1] + [0] + [NewDeco[-1]*-1] for NewDeco in cob.decos]
+        else:
+            newDecos = [NewDeco[:-1] + [0] + NewDeco[-1:] for NewDeco in cob.decos]
+        NewCob = Cob.mor(Newgens[source], Newgens[target], Cob.simplify_decos(newDecos), newcomps)
+        reduced = NewCob.ReduceDecorations()
+        if reduced != 0:
+            Newdiff[target, source] = reduced
     return CobComplex(Newgens, Newdiff)
 
 def AddCupToCLT(clt, i):
@@ -296,244 +356,246 @@ def AddCupToCLT(clt, i):
 
 def AddCup(Complex, i): # TODO: reduce decorations
     """ Here 0 <= i <= tangle.bot -2"""
+    # Precompute per-gen: does this CLT become "closed" under the cup, and
+    # what's the starting new-index?  Closed gens contribute 2 new gens, open
+    # gens contribute 1.  This lets us pre-size the output matrix and place
+    # each cob at its correct (row, col) without the N*N Python iteration.
+    old_gens = Complex.gens
+    N = len(old_gens)
+    closed = [g.arcs[g.top + i] == g.top + i + 1 for g in old_gens]
+    new_start = [0] * N
+    acc = 0
+    for k in range(N):
+        new_start[k] = acc
+        acc += 2 if closed[k] else 1
+    new_N = acc
+
     newgens = []
-    for clt in Complex.gens:
+    for clt in old_gens:
         newgens.extend(AddCupToCLT(clt, i))
-    Newdiff = []
-    for target, row in enumerate(Complex.diff):
-        newRow = []
-        nextRow = []
-        for source, cob in enumerate(row):
-            def decrementby2(j): #shifts TEI by -2 if it is greater than where the cup i added
-                if j >= cob.front.top+i:
-                    return j-2
+
+    # Cache AddCupToCLT results (used per old-gen up to twice in the original,
+    # once for source and once for target).
+    new_clts_per_gen = [None] * N
+
+    def get_new_clts(k):
+        if new_clts_per_gen[k] is None:
+            new_clts_per_gen[k] = AddCupToCLT(old_gens[k], i)
+        return new_clts_per_gen[k]
+
+    Newdiff = np.zeros((new_N, new_N), dtype=object)
+
+    # We only need to visit non-zero entries of the old diff.  The inner body
+    # below is the original 4-branch logic, modified to *write* into the
+    # pre-allocated matrix at the correct offsets rather than appending to
+    # row lists.
+    for target, source in Complex._nnz:
+        cob = Complex.diff[target, source]
+        base = cob.front.top + i
+
+        def decrementby2(j, _b=base):
+            return j - 2 if j >= _b else j
+
+        def compcup(component):
+            return [decrementby2(j) for j in component if j != base and j != base + 1]
+
+        def incrementH(decoration):
+            return [decoration[0] + 1] + decoration[1:]
+
+        def negativeH(decoration):
+            return [decoration[0] + 1] + decoration[1:-1] + [decoration[-1] * -1]
+
+        def adddotonindex(decoration, idx):
+            return decoration[:idx + 1] + [1] + decoration[idx + 2:]
+
+        src_closed = closed[source]
+        tgt_closed = closed[target]
+        row0 = new_start[target]
+        col0 = new_start[source]
+
+        if src_closed and tgt_closed:
+            # both closed: produce Cob1 at (r0,c0), Cob3 at (r0+1,c0), Cob4 at (r0+1,c0+1).
+            # Cob2 (at (r0,c0+1)) is 0 and is already zero in Newdiff.
+            magic_index = -1
+            for x, comp in enumerate(cob.comps):
+                if base in comp:
+                    if len(comp) != 2:
+                        raise Exception("closed component doesn't have 2 TEI")
+                    magic_index = x
+                    break
+            if magic_index == -1:
+                raise Exception("no magic_index")
+            newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps if base not in comp]
+
+            def delclosedcomp(deco, _mi=magic_index):
+                return deco[:_mi + 1] + deco[_mi + 2:]
+
+            def computedeco4(deco, _mi=magic_index):
+                if deco[_mi + 1] == 0:
+                    return delclosedcomp(deco)
                 else:
-                    return j
-            
-            def compcup(component): #computes the new component after adding a cup, for components except those with only 2 entries, which are clt.top+i and clt.top+i+1
-                return [decrementby2(j) for j in component if j != cob.front.top+i and j!= cob.front.top+i+1]
-            def incrementH(decoration): # Increments H of a decoration by 1
-                return [decoration[0]+1] + decoration[1:]
-            def negativeH(decoration): # Increments H of a decoration by 1, and flips the sign on the coefficient
-                return [decoration[0]+1] + decoration[1:-1] +[decoration[-1]*-1]
-            def adddotonindex(decoration, index_to_add): # adds dot to the component labeled by index_to_add if there is no dot already, otherwise does nothing
-                return decoration[:index_to_add+1] + [1] + decoration[index_to_add+2:]
-            
-            if Complex.gens[source].arcs[Complex.gens[source].top +i] == Complex.gens[source].top+i+1 \
-                and Complex.gens[target].arcs[Complex.gens[target].top +i] == Complex.gens[target].top+i+1: # source and target are both closed, add 2 cobordisms to newRow and nextRow
-                if cob == 0:
-                    newRow.append(0)
-                    newRow.append(0)
-                    nextRow.append(0)
-                    nextRow.append(0)
-                else: # is not the 0 cob
-                    magic_index = 0 # the index of the first component that the cup connects to
-                    for x,comp in enumerate(cob.comps):
-                        if cob.front.top +i in comp:
-                            if len(comp) != 2:
-                                raise Exception("closed component doesn't have 2 TEI")
-                            magic_index = x
-                            break
+                    return delclosedcomp(incrementH(deco))
+
+            newDecos1 = [delclosedcomp(deco) for deco in cob.decos if deco[magic_index + 1] == 0]
+            newDecos3 = [delclosedcomp(deco) for deco in cob.decos if deco[magic_index + 1] == 1]
+            newDecos4 = [computedeco4(deco) for deco in cob.decos]
+            nsc = get_new_clts(source)
+            ntc = get_new_clts(target)
+            C1 = Cob.mor(nsc[0], ntc[0], Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
+            C3 = Cob.mor(nsc[0], ntc[1], Cob.simplify_decos(newDecos3), newcomps).ReduceDecorations()
+            C4 = Cob.mor(nsc[1], ntc[1], Cob.simplify_decos(newDecos4), newcomps).ReduceDecorations()
+            if C1 != 0: Newdiff[row0,     col0]     = C1
+            if C3 != 0: Newdiff[row0 + 1, col0]     = C3
+            if C4 != 0: Newdiff[row0 + 1, col0 + 1] = C4
+        elif tgt_closed:  # target closed, source open
+            magic_index = -1
+            for x, comp in enumerate(cob.comps):
+                if base in comp:
+                    magic_index = x
+                    break
+            if magic_index == -1:
+                raise Exception("no magic_index")
+            newcomps = [compcup(component) for component in cob.comps]
+            newDecos1 = []
+            for deco in cob.decos:
+                if deco[magic_index + 1] == 0:
+                    newDecos1.extend([adddotonindex(deco, magic_index), negativeH(deco)])
+            newDecos2 = [deco for deco in cob.decos]
+            nsrc = get_new_clts(source)[0]
+            ntc = get_new_clts(target)
+            C1 = Cob.mor(nsrc, ntc[0], Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
+            C2 = Cob.mor(nsrc, ntc[1], Cob.simplify_decos(newDecos2), newcomps).ReduceDecorations()
+            if C1 != 0: Newdiff[row0,     col0] = C1
+            if C2 != 0: Newdiff[row0 + 1, col0] = C2
+        elif src_closed:  # source closed, target open
+            magic_index = -1
+            for x, comp in enumerate(cob.comps):
+                if base in comp:
+                    magic_index = x
+                    break
+            if magic_index == -1:
+                raise Exception("no magic_index")
+            newcomps = [compcup(component) for component in cob.comps]
+
+            def computedeco2(deco, _mi=magic_index):
+                if deco[_mi + 1] == 1:
+                    return incrementH(deco)
+                else:
+                    return adddotonindex(deco, _mi)
+
+            newDecos1 = [deco for deco in cob.decos]
+            newDecos2 = [computedeco2(deco) for deco in cob.decos]
+            nsc = get_new_clts(source)
+            ntgt = get_new_clts(target)[0]
+            C1 = Cob.mor(nsc[0], ntgt, Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
+            C2 = Cob.mor(nsc[1], ntgt, Cob.simplify_decos(newDecos2), newcomps).ReduceDecorations()
+            if C1 != 0: Newdiff[row0, col0]     = C1
+            if C2 != 0: Newdiff[row0, col0 + 1] = C2
+        else:  # both open
+            magic_index = -1
+            for x1, comp in enumerate(cob.comps):
+                if base in comp:
+                    magic_index = x1
+                    break
+            if magic_index == -1:
+                raise Exception("no magic_index")
+            magic_index_2 = -1
+            for x2, comp in enumerate(cob.comps):
+                if base + 1 in comp:
+                    magic_index_2 = x2
+                    break
+            if magic_index_2 == -1:
+                raise Exception("no magic_index_2")
+
+            newDecos1 = []
+            if magic_index == magic_index_2:
+                comp = cob.comps[magic_index]
+                x1 = comp.index(base)
+                x2 = comp.index(base + 1)
+                comp1 = comp[:min(x1, x2)] + comp[max(x1, x2) + 1:]
+                comp2 = comp[min(x1, x2) + 1:max(x1, x2)]
+                newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps[:magic_index] + [comp1, comp2] + cob.comps[magic_index + 1:]]
+
+                def computedeco1comps(deco, _mi=magic_index):
+                    if deco[_mi + 1] == 1:
+                        return [deco[:_mi + 1] + [1] + deco[_mi + 1:]]
                     else:
-                        raise Exception("no magic_index")
-                    # magic_index = next(j for j, v in enumerate(cob.comps) if len(v) == 2 and cob.front.top+i in v and cob.front.top+i+1 in v) #computes index of closed component, should be the same as magic_index computed generally above
-                    newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps if cob.front.top+i not in comp ]
-                    def delclosedcomp(decoration): # deletes the decoration corresponding to the closed component, which is to be removed
-                        return decoration[:magic_index+1] + decoration[magic_index+2:]
-                    def computedeco4(decoration):
-                        if decoration[magic_index +1] == 0:
-                            return delclosedcomp(decoration) # id on all other components if no dot
-                        else:
-                            return delclosedcomp(incrementH(decoration)) # H times rest of cobordism if dot
-                    
-                    newDecos1 = [delclosedcomp(deco) for deco in cob.decos if deco[magic_index+1] == 0] # identity on all other components if no dot, otherwise 0
-                    newDecos3 = [delclosedcomp(deco) for deco in cob.decos if deco[magic_index+1] == 1] # identity on all other components if dot, otherwise 0
-                    newDecos4 = [computedeco4(deco) for deco in cob.decos] # see computedeco4()
-                    newsourceclts = AddCupToCLT(cob.front, i)
-                    newtargetclts = AddCupToCLT(cob.back, i)
-                    Cobordism1 = Cob.mor(newsourceclts[0], newtargetclts[0], Cob.simplify_decos(newDecos1), newcomps)
-                    Cobordism2 = 0 # The neckcutting/delooping isomorphism will give us 0 for Cobordism 2
-                    Cobordism3 = Cob.mor(newsourceclts[0], newtargetclts[1], Cob.simplify_decos(newDecos3), newcomps)
-                    Cobordism4 = Cob.mor(newsourceclts[1], newtargetclts[1], Cob.simplify_decos(newDecos4), newcomps)
-                    newRow.append(Cobordism1.ReduceDecorations())
-                    newRow.append(Cobordism2)
-                    nextRow.append(Cobordism3.ReduceDecorations())
-                    nextRow.append(Cobordism4.ReduceDecorations())
-            elif Complex.gens[target].arcs[Complex.gens[target].top +i] == Complex.gens[target].top+i+1: # source is open but target is closed, add 1 cobordism to each
-                if cob == 0:
-                    newRow.append(0)
-                    nextRow.append(0)
-                else: # is not the 0 cob
-                    magic_index = 0 # the index of the first component that the cup connects to
-                    for x,comp in enumerate(cob.comps):
-                        if cob.front.top +i in comp:
-                            magic_index = x
-                            break
+                        return [deco[:_mi + 1] + [1] + deco[_mi + 1:],
+                                deco[:_mi + 2] + [1] + deco[_mi + 2:],
+                                [deco[0] + 1] + deco[1:_mi + 1] + [0] + deco[_mi + 1:-1] + [deco[-1] * -1]]
+
+                for deco in cob.decos:
+                    newDecos1.extend(computedeco1comps(deco))
+            else:
+                comp1 = cob.comps[magic_index]
+                comp2 = cob.comps[magic_index_2]
+                location1 = comp1.index(base)
+                location2 = comp2.index(base + 1)
+                comp2 = (comp2[location2 + 1:] + comp2[:location2])
+                if location1 % 2 == location2 % 2:
+                    comp2.reverse()
+                comp1 = comp1[:location1] + comp2 + comp1[location1 + 1:]
+                newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps[:magic_index] + [comp1] + cob.comps[magic_index + 1:]]
+                del newcomps[magic_index_2]
+
+                def computedeco2comps(deco, _mi=magic_index, _mi2=magic_index_2):
+                    if deco[_mi + 1] == 1 and deco[_mi2 + 1] == 1:
+                        return incrementH(deco)[:_mi2 + 1] + incrementH(deco)[_mi2 + 2:]
+                    elif deco[_mi + 1] == 1 or deco[_mi2 + 1] == 1:
+                        return adddotonindex(deco, _mi)[:_mi2 + 1] + adddotonindex(deco, _mi)[_mi2 + 2:]
                     else:
-                        raise Exception("no magic_index")
-                    newcomps = [compcup(component) for component in cob.comps]
-                    newDecos1 = []
-                    for decoration in cob.decos:
-                        if decoration[magic_index+1] == 0: # is D - H if no dot, 0 otherwise
-                            newDecos1.extend([adddotonindex(decoration, magic_index), negativeH(decoration)])
-                    newDecos2 = [deco for deco in cob.decos] # is identity regardless of dot or not
-                    newsourceclt = AddCupToCLT(cob.front, i)[0]
-                    newtargetclts = AddCupToCLT(cob.back, i)
-                    Cobordism1 = Cob.mor(newsourceclt, newtargetclts[0], Cob.simplify_decos(newDecos1), newcomps)
-                    Cobordism2 = Cob.mor(newsourceclt, newtargetclts[1], Cob.simplify_decos(newDecos2), newcomps)
-                    newRow.append(Cobordism1.ReduceDecorations())
-                    nextRow.append(Cobordism2.ReduceDecorations())
-            elif Complex.gens[source].arcs[Complex.gens[source].top +i] == Complex.gens[source].top+i+1: # source is closed but target is open, add 2 cobordisms to newRow only
-                if cob == 0:
-                    newRow.append(0)
-                    newRow.append(0)
-                else: # is not the 0 cob
-                    magic_index = 0 # the index of the first component that the cup connects to
-                    for x,comp in enumerate(cob.comps):
-                        if cob.front.top +i in comp:
-                            magic_index = x
-                            break
-                    else:
-                        raise Exception("no magic_index")
-                    newcomps = [compcup(component) for component in cob.comps]
-                    def computedeco2(decoration):
-                        if decoration[magic_index+1] == 1:
-                            return incrementH(decoration) # H trading if already a dot
-                        else:
-                            return adddotonindex(decoration, magic_index) # otherwise add a dot
-                    newDecos1 = [deco for deco in cob.decos] # always the identity
-                    newDecos2 = [computedeco2(deco) for deco in cob.decos]
-                    newsourceclts = AddCupToCLT(cob.front, i)
-                    newtargetclt = AddCupToCLT(cob.back, i)[0]
-                    Cobordism1 = Cob.mor(newsourceclts[0], newtargetclt, Cob.simplify_decos(newDecos1), newcomps)
-                    Cobordism2 = Cob.mor(newsourceclts[1], newtargetclt, Cob.simplify_decos(newDecos2), newcomps)
-                    newRow.append(Cobordism1.ReduceDecorations())
-                    newRow.append(Cobordism2.ReduceDecorations())
-            else: # source and target are both open, add 1 cobordism to newRow only
-                if cob == 0:
-                    newRow.append(0)
-                else: # is not the 0 cob
-                    # print("i", i)
-                    # print("cob.front.top", cob.front.top)
-                    # print("cob.front.top+i", cob.front.top+i)
-                    # print(cob.comps)
-                    magic_index = 0 # the index of the first component that the cup connects to
-                    for x1,comp in enumerate(cob.comps):
-                        if cob.front.top +i in comp:
-                            magic_index = x1
-                            break
-                    else:
-                        raise Exception("no magic_index")
-                    magic_index_2 = 0 # index of component containing i+1
-                    for x2,comp in enumerate(cob.comps):
-                        if cob.front.top+i+1 in comp:
-                            magic_index_2 = x2
-                            break
-                    else:
-                        raise Exception("no magic_index_2")
-                    # print("magic indices:", magic_index, magic_index_2)
-                    newDecos1 = []
-                    if magic_index == magic_index_2: # only one component being connected via cup
-                        # print("magic indices are the same")
-                        comp = cob.comps[magic_index] # the component being connected
-                        x1 = comp.index(cob.front.top +i) 
-                        x2 = comp.index(cob.front.top +i + 1)
-                        comp1 = comp[:min(x1, x2)] + comp[max(x1, x2)+1:]
-                        comp2 = comp[min(x1, x2) +1:max(x1, x2)]
-                        newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps[:magic_index] +[comp1, comp2] + cob.comps[magic_index+1:]]
-                        def computedeco1comps(decoration):
-                            if decoration[magic_index+1] == 1:
-                                return [decoration[:magic_index+1] +[1] + decoration[magic_index+1:]]
-                            else:
-                                return [decoration[:magic_index+1] +[1] + decoration[magic_index+1:] , \
-                                        decoration[:magic_index+2] +[1] + decoration[magic_index+2:], \
-                                        [decoration[0]+1] + decoration[1:magic_index+1] +[0] + decoration[magic_index+1:-1] + [decoration[-1]*-1]]
-                        for deco in cob.decos:
-                            newDecos1.extend(computedeco1comps(deco))
-                    else: # two seperate components being connected via cup
-                        comp1 = cob.comps[magic_index] # the component containing i
-                        comp2 = cob.comps[magic_index_2] # the component containing i+1
-                        location1 = comp1.index(cob.front.top+i)
-                        location2 = comp2.index(cob.front.top+i+1)
-                        comp2 = (comp2[location2+1:] + comp2[:location2]) #rotates list until i+1 is at front, and removes it
-                        if location1 %2 == location2%2: # if top/bot dont line up, flip comp2
-                            comp2.reverse()
-                        comp1 = comp1[:location1] + comp2 + comp1[location1+1:] # insert comp2 into comp1, and dont include element i
-                        newcomps = [[decrementby2(j) for j in comp] for comp in cob.comps[:magic_index] + [comp1] + cob.comps[magic_index+1:]]
-                        del newcomps[magic_index_2]
-                        def computedeco2comps(decoration):
-                            if decoration[magic_index+1] == 1 and decoration[magic_index_2+1]==1:
-                                # newdecos = incrementH(decoration)
-                                # del newdecos[magic_index_2+1]
-                                # print("old decos:", incrementH(decoration)[:magic_index_2+1] + incrementH(decoration)[magic_index_2+2:])
-                                # print("newdecos:", newdecos)
-                                return incrementH(decoration)[:magic_index_2+1] + incrementH(decoration)[magic_index_2+2:]
-                            elif decoration[magic_index+1] == 1 or decoration[magic_index_2+1]==1:
-                                # newdecos = adddotonindex(decoration, magic_index)
-                                # del newdecos[magic_index_2+1]
-                                # print("old decos:", adddotonindex(decoration, magic_index)[:magic_index_2+1] + adddotonindex(decoration, magic_index)[magic_index_2+2:])
-                                # print("newdecos:", newdecos)
-                                return adddotonindex(decoration, magic_index)[:magic_index_2+1] + adddotonindex(decoration, magic_index)[magic_index_2+2:]
-                            else:
-                                return decoration[:magic_index_2+1] + decoration[magic_index_2+2:]
-                        newDecos1 = [computedeco2comps(deco) for deco in cob.decos]
-                    newsourceclt = AddCupToCLT(cob.front, i)[0]
-                    newtargetclt = AddCupToCLT(cob.back, i)[0]
-                    Cobordism1 = Cob.mor(newsourceclt, newtargetclt, Cob.simplify_decos(newDecos1), newcomps)
-                    newRow.append(Cobordism1.ReduceDecorations())
-        Newdiff.append(newRow)
-        if Complex.gens[target].arcs[Complex.gens[target].top +i] == Complex.gens[target].top+i+1: # target is closed
-            Newdiff.append(nextRow)
+                        return deco[:_mi2 + 1] + deco[_mi2 + 2:]
+
+                newDecos1 = [computedeco2comps(deco) for deco in cob.decos]
+
+            nsrc = get_new_clts(source)[0]
+            ntgt = get_new_clts(target)[0]
+            C1 = Cob.mor(nsrc, ntgt, Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
+            if C1 != 0: Newdiff[row0, col0] = C1
+
     return CobComplex(newgens, Newdiff)
   
 def AddPosCrossing(Complex, i):
     CapCup = AddCap(AddCup(Complex, i), i, "true")
     sourcegens = Complex.gens
     targetgens = CapCup.gens
-    
+    N = len(sourcegens)
+    M = len(targetgens)
+
     TopLeft = Complex.diff
     BottomRight = CapCup.diff
-    TopRight = np.full((len(Complex.gens), len(CapCup.gens)), 0, Cob.mor)
-    BottomLeft = []
-    
-    for x, targetclt in enumerate(Complex.gens):
-        if targetclt.arcs[targetclt.top +i] == targetclt.top+i+1: #targetclt is closed
-            newRow = []
-            nextRow = []
-            for y, sourceclt in enumerate(Complex.gens):
-                if x == y:
-                    newTarget1 = AddCapToCLT(AddCupToCLT(targetclt, i)[0], i, "true")
-                    newTarget2 = AddCapToCLT(AddCupToCLT(targetclt, i)[1], i, "true")
-                    newcomps = Cob.components(sourceclt, newTarget1)
-                    magic_index = 0
-                    for z,comp in enumerate(newcomps):
-                        if sourceclt.top +i in comp:
-                            magic_index = z
-                            break
-                    decos1 = [[0] + [0 for comp in newcomps[:magic_index]] + [1] + [0 for comp in newcomps[magic_index+1:]] + [1], [1] + [0 for comp in newcomps] + [-1]] #Compute new decos via neckcutting
-                    decos2 = [[0] + [0 for comp in newcomps] + [1]]
-                    NewCobordism1 = Cob.mor(sourceclt, newTarget1, decos1, newcomps)
-                    NewCobordism2 = Cob.mor(sourceclt, newTarget2, decos2, newcomps)
-                    newRow.append(NewCobordism1)
-                    nextRow.append(NewCobordism2)
-                else:
-                    newRow.append(0)
-                    nextRow.append(0)
-            BottomLeft.append(newRow)
-            BottomLeft.append(nextRow)
+    TopRight = np.zeros((N, M), dtype=object)
+
+    # BottomLeft is an M x N matrix whose only non-zero cells lie on the
+    # "x == y" diagonal (1 or 2 cells per x depending on whether targetclt
+    # is closed).  Iterate x directly instead of the full M*N grid.
+    BottomLeft = np.zeros((M, N), dtype=object)
+    row_cursor = 0
+    for x, targetclt in enumerate(sourcegens):
+        sourceclt = sourcegens[x]  # x == y case of the original
+        if targetclt.arcs[targetclt.top + i] == targetclt.top + i + 1:
+            newTarget1 = AddCapToCLT(AddCupToCLT(targetclt, i)[0], i, "true")
+            newTarget2 = AddCapToCLT(AddCupToCLT(targetclt, i)[1], i, "true")
+            newcomps = Cob.components(sourceclt, newTarget1)
+            magic_index = 0
+            for z, comp in enumerate(newcomps):
+                if sourceclt.top + i in comp:
+                    magic_index = z
+                    break
+            decos1 = [[0] + [0 for _ in newcomps[:magic_index]] + [1] + [0 for _ in newcomps[magic_index + 1:]] + [1],
+                      [1] + [0 for _ in newcomps] + [-1]]
+            decos2 = [[0] + [0 for _ in newcomps] + [1]]
+            BottomLeft[row_cursor,     x] = Cob.mor(sourceclt, newTarget1, decos1, newcomps)
+            BottomLeft[row_cursor + 1, x] = Cob.mor(sourceclt, newTarget2, decos2, newcomps)
+            row_cursor += 2
         else:
-            newRow = []
-            for y, sourceclt in enumerate(Complex.gens):
-                if x == y:
-                    newTarget = AddCapToCLT(AddCupToCLT(targetclt, i)[0], i, "true")
-                    decos = [[0] + [0 for comp in Cob.components(sourceclt, newTarget)] + [1]]
-                    NewCobordism = Cob.mor(sourceclt, newTarget, decos)
-                    newRow.append(NewCobordism)
-                else:
-                    newRow.append(0)
-            BottomLeft.append(newRow)
-    Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis = 1), \
-                              np.concatenate((BottomLeft, BottomRight), axis = 1)), axis = 0)
+            newTarget = AddCapToCLT(AddCupToCLT(targetclt, i)[0], i, "true")
+            decos = [[0] + [0 for _ in Cob.components(sourceclt, newTarget)] + [1]]
+            BottomLeft[row_cursor, x] = Cob.mor(sourceclt, newTarget, decos)
+            row_cursor += 1
+
+    Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis=1),
+                              np.concatenate((BottomLeft, BottomRight), axis=1)), axis=0)
     return CobComplex(sourcegens + targetgens, Newdiff)
 
 def grshiftclt(clt):
@@ -549,115 +611,169 @@ def AddNegCrossing(Complex, i):
     targetgens = [grshiftclt(clt) for clt in Complex.gens]
     CapCup = AddCap(AddCup(Complex, i), i)
     sourcegens = CapCup.gens
-    
+    N = len(Complex.gens)
+    M = len(sourcegens)
+
     TopLeft = CapCup.diff
-    BottomRight = [[grshiftcob(cob) for cob in row] for row in Complex.diff]
-    TopRight = np.full((len(sourcegens), len(targetgens)), 0, Cob.mor)
-    BottomLeft = []
-    
-    for x, targetclt in enumerate(Complex.gens):
-        newRow = []
-        for y, sourceclt in enumerate(Complex.gens):
-            if sourceclt.arcs[sourceclt.top +i] == sourceclt.top+i+1: #sourceclt is closed
-                if x == y:
-                    newSource1 = AddCapToCLT(AddCupToCLT(sourceclt, i)[0], i)
-                    newSource2 = AddCapToCLT(AddCupToCLT(sourceclt, i)[1], i)
-                    newTarget = targetgens[x]
-                    newcomps = Cob.components(newSource2, newTarget)
-                    magic_index = 0
-                    for z,comp in enumerate(newcomps):
-                        if sourceclt.top +i in comp:
-                            magic_index = z
-                            break
-                    decos1 = [[0] + [0 for comp in newcomps] + [1]]
-                    decos2 = [[0] + [0 for comp in newcomps[:magic_index]] + [1] + [0 for comp in newcomps[magic_index+1:]] + [1]]
-                    newCobordism1 = Cob.mor(newSource1, newTarget, decos1, newcomps)
-                    newCobordism2 = Cob.mor(newSource2, newTarget, decos2, newcomps)
-                    newRow.append(newCobordism1)
-                    newRow.append(newCobordism2)
-                else:
-                    newRow.append(0)
-                    newRow.append(0)
-            else: #sourceclt is open
-                if x == y:
-                    newSource = AddCapToCLT(AddCupToCLT(sourceclt, i)[0], i)
-                    newTarget = targetgens[x]
-                    decos = [[0] + [0 for comp in Cob.components(newSource, newTarget)] + [1]]
-                    newCobordism = Cob.mor(newSource, newTarget, decos)
-                    newRow.append(newCobordism)
-                else:
-                    newRow.append(0)
-        BottomLeft.append(newRow)
-    Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis = 1), \
-                              np.concatenate((BottomLeft, BottomRight), axis = 1)), axis = 0)
+
+    # BottomRight = grshift of the original diff.  Build sparsely: iterate
+    # only non-zero cells of Complex.diff rather than N*N Python cells.
+    BottomRight = np.zeros((N, N), dtype=object)
+    for t, s in Complex._nnz:
+        BottomRight[t, s] = grshiftcob(Complex.diff[t, s])
+
+    TopRight = np.zeros((M, N), dtype=object)
+
+    # BottomLeft has the same diagonal-only structure as in AddPosCrossing:
+    # non-zero only where the column index (source) matches the row's
+    # originating generator.  Iterate columns directly.
+    BottomLeft = np.zeros((N, M), dtype=object)
+    col_cursor = 0
+    for x, sourceclt in enumerate(Complex.gens):
+        newTarget = targetgens[x]
+        if sourceclt.arcs[sourceclt.top + i] == sourceclt.top + i + 1:
+            newSource1 = AddCapToCLT(AddCupToCLT(sourceclt, i)[0], i)
+            newSource2 = AddCapToCLT(AddCupToCLT(sourceclt, i)[1], i)
+            newcomps = Cob.components(newSource2, newTarget)
+            magic_index = 0
+            for z, comp in enumerate(newcomps):
+                if sourceclt.top + i in comp:
+                    magic_index = z
+                    break
+            decos1 = [[0] + [0 for _ in newcomps] + [1]]
+            decos2 = [[0] + [0 for _ in newcomps[:magic_index]] + [1] + [0 for _ in newcomps[magic_index + 1:]] + [1]]
+            BottomLeft[x, col_cursor]     = Cob.mor(newSource1, newTarget, decos1, newcomps)
+            BottomLeft[x, col_cursor + 1] = Cob.mor(newSource2, newTarget, decos2, newcomps)
+            col_cursor += 2
+        else:
+            newSource = AddCapToCLT(AddCupToCLT(sourceclt, i)[0], i)
+            decos = [[0] + [0 for _ in Cob.components(newSource, newTarget)] + [1]]
+            BottomLeft[x, col_cursor] = Cob.mor(newSource, newTarget, decos)
+            col_cursor += 1
+
+    Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis=1),
+                              np.concatenate((BottomLeft, BottomRight), axis=1)), axis=0)
     return CobComplex(sourcegens + targetgens, Newdiff)
 
-def BNbracket(string,pos=0,neg=0,start=1,options="unsafe"):
+def BNbracket(string,pos=0,neg=0,start=1,options="unsafe",cleanup_field=None):
     """compute the Bar-Natan bracket for tangle specified by 'string', which is a concatenation of words <type>+<index>, separated by '.' read from right to left, for each elementary tangle slice, read from top to bottom, where:
     <type> is equal to:
         'pos': positive crossing
         'neg': negative crossing
         'cup': cup
         'cap': cap
-    <index> is the index at which the crossing, cap or cup sits. 
-    'pos' and 'neg' are the numbers of positive and negative crossings. 
+    <index> is the index at which the crossing, cap or cup sits.
+    'pos' and 'neg' are the numbers of positive and negative crossings.
     The first optional parameter 'start' is an integer which specifies the number of tangle ends at the top.
     The second optional parameter 'options' is either 'unsafe' (default) or 'safe'. The latter performs some sanity checks, but slows down the computation.
+    The third optional parameter 'cleanup_field' enables intermediate (1,3)
+    cleanup: whenever the running complex is in a (1,3) state, convert to
+    BNAlgebra(cleanup_field), run the immersed-curve clean_up, and convert
+    back via BNComplex.ToCob.  The round-trip is mathematically correct
+    (final invariants match), but is EXPERIMENTAL and usually hurts
+    performance: the Cob category has no field knowledge, so coefficients
+    returned from ToCob are integer representatives in [0, p) and will
+    inflate through subsequent slice operations until the final
+    ToBNAlgebra(field) mods them out.  On a 3-braid test this made the
+    total ~50x slower.  Only worth turning on for tangles with many (1,3)
+    checkpoints AND a follow-up cob-level mod-p simplification (not yet
+    implemented).  Pass None to disable (default).
     E.g. 'BNbracket('cup0pos0',2)' is a (2,0)-tangle which is decomposed as a positive crossing followed by a cap.
     """
     stringlist=[[word[0:3],int(word[3:])] for word in string.split('.')]
-    cx=CobComplex([Cob.obj(start,start,[start+i for i in range(start)]+[i for i in range(start)], 0,0,0)], [[0]])
-    print("Computing the Bar-Natan bracket for the tangle\n\n"+string+"\n\n"+"with "+str(start)+" ends at the top, "+str(pos)+\
-          " positive crossings, "+str(neg)+" negative crossings and "+str(len(stringlist))+" slices in total.")
-          
-    time0=time()
-    time1=time0
-    
-    for i,word in enumerate(stringlist):
-        
-        time2=time()
-        print("slice "+str(i)+"/"+str(len(stringlist))+": adding "+word[0]+" at index "+str(word[1])+" to tangle. ("+str(len(cx.gens))+" objects, "+str(round(time2-time1,1))+" sec)", end='\r')# monitor \n ->\r
-        time1=time2
-        
-        if word[0]=="pos":
-            cx=AddPosCrossing(cx, word[1])
-            # print("before eliminateAll")
-            #cx.print, "old long")
-            if options=="safe": cx.validate()
-            cx.eliminateAll()
-            # print("after eliminateAll")
-            # cx.print, "old long")
-        
-        elif word[0]=="neg":
-            cx=AddNegCrossing(cx, word[1])
-            #print("before eliminateAll")
-            #cx.print, "old long")
-            if options=="safe": cx.validate()
-            cx.eliminateAll()
-            # print("after eliminateAll")
-            # cx.print, "old long")
-        
-        elif word[0]=="cup":
-            cx=AddCup(cx, word[1])
-            #print("before eliminateAll")
-            #cx.print, "old long")
-            if options=="safe": cx.validate()
-            cx.eliminateAll()
-            #print("after eliminateAll")
-            #cx.print, "old long")
-        
-        elif word[0]=="cap":
-            cx=AddCap(cx, word[1])
-            if options=="safe": cx.validate()
-            
-        else:
-            print("this should never execute")
+    # Activate F_p arithmetic in the Cob layer for the duration of this
+    # BNbracket call when intermediate cleanup is requested.  This keeps the
+    # integer representatives returned by ToCob small (and simplify_decos
+    # automatically collapses 1+1=2 -> 0 in F_2, etc.).  Reverted in the
+    # finally-block at the end of this function.
+    # F_p arithmetic in Cob is activated lazily the first time an actual
+    # intermediate cleanup fires.  This avoids paying mod-p overhead on
+    # tangles where cleanup_field was requested but no (1,3) checkpoint
+    # ever produced simplification (e.g. 3braid_scaled, whose only
+    # candidate is a 1-gen slice).
+    _fp_state = {"prev": None, "active": False}
 
+    def _activate_fp():
+        if not _fp_state["active"]:
+            _fp_state["prev"] = Cob.set_field(cleanup_field)
+            _fp_state["active"] = True
 
-    cx.shift_qhd(pos-2*neg,-neg,0.5*neg)
-    
-    print("Completed the computation successfully after "+str(round(time1-time0,1))+" second(s).                        ")
-    return cx
+    try:
+        cx=CobComplex([Cob.obj(start,start,[start+i for i in range(start)]+[i for i in range(start)], 0,0,0)], [[0]])
+        print("Computing the Bar-Natan bracket for the tangle\n\n"+string+"\n\n"+"with "+str(start)+" ends at the top, "+str(pos)+\
+              " positive crossings, "+str(neg)+" negative crossings and "+str(len(stringlist))+" slices in total.")
+
+        time0=time()
+        time1=time0
+
+        def _maybe_intermediate_cleanup(cx, is_last):
+            # Safe only when all gens are (1,3)-CLTs (i.e., the running tangle has
+            # shrunk to a 4-ended state).  The BN-algebra round-trip then gives
+            # an aggressive simplification, because BNComplex.clean_up applies
+            # immersed-curve arrow-shortening isotopies that Gaussian elimination
+            # alone can't see.
+            #
+            # Skip conditions:
+            #   - cleanup_field is None: feature not requested.
+            #   - is_last: caller will do ToBNAlgebra + eliminateAll anyway,
+            #     so intermediate cleanup here would be duplicate work.
+            #   - len(cx.gens) <= 1: nothing for clean_up to do.
+            if cleanup_field is None or not cx.gens or is_last or len(cx.gens) <= 1:
+                return cx
+            g0 = cx.gens[0]
+            if not (g0.top == 1 and g0.bot == 3):
+                return cx
+            before = len(cx.gens)
+            BN = cx.ToBNAlgebra(cleanup_field)
+            BN.clean_up()
+            cx2 = BN.ToCob()
+            after = len(cx2.gens)
+            # Now that ToCob has emitted integer representatives in [0, p),
+            # flip Cob into F_p mode for the remaining slices so coefficients
+            # stay small through subsequent AddCup/AddPos/etc.
+            _activate_fp()
+            if after < before:
+                print("intermediate-cleanup: (1,3) reduction "+str(before)+" -> "+str(after)+" gens", end='\r')
+            return cx2
+
+        num_slices = len(stringlist)
+        for i,word in enumerate(stringlist):
+
+            time2=time()
+            print("slice "+str(i)+"/"+str(len(stringlist))+": adding "+word[0]+" at index "+str(word[1])+" to tangle. ("+str(len(cx.gens))+" objects, "+str(round(time2-time1,1))+" sec)", end='\r')# monitor \n ->\r
+            time1=time2
+
+            if word[0]=="pos":
+                cx=AddPosCrossing(cx, word[1])
+                if options=="safe": cx.validate()
+                cx.eliminateAll()
+
+            elif word[0]=="neg":
+                cx=AddNegCrossing(cx, word[1])
+                if options=="safe": cx.validate()
+                cx.eliminateAll()
+
+            elif word[0]=="cup":
+                cx=AddCup(cx, word[1])
+                if options=="safe": cx.validate()
+                cx.eliminateAll()
+
+            elif word[0]=="cap":
+                cx=AddCap(cx, word[1])
+                if options=="safe": cx.validate()
+
+            else:
+                print("this should never execute")
+
+            cx = _maybe_intermediate_cleanup(cx, is_last=(i == num_slices - 1))
+
+        cx.shift_qhd(pos-2*neg,-neg,0.5*neg)
+
+        print("Completed the computation successfully after "+str(round(time1-time0,1))+" second(s).                        ")
+        return cx
+    finally:
+        if _fp_state["active"]:
+            Cob.set_field(_fp_state["prev"])
 
 def importCobcx(filename):
     with open("examples/data/CobComplexes/"+filename, "r") as text_file:

@@ -20,6 +20,33 @@ from tabulate import tabulate
 import BNAlgebra
 from auxiliary import *
 
+# Optional F_p awareness.  When set to a prime p, every coefficient produced
+# by simplify_decos (and mor addition) is reduced mod p.  Default None means
+# integer arithmetic (the historical Cob-over-Z behaviour).
+#
+# This hook exists so that intermediate (1,3) cleanup in BNbracket (which
+# routes Cob -> BNAlgebra(F_p) -> clean_up -> Cob) can keep the returned
+# integer coefficients small through the remaining slices instead of letting
+# them inflate until the final ToBNAlgebra(p) mod-out.
+#
+# CAVEAT: the library's algebra originally assumed Z-coefficients.  Setting
+# _field != None switches arithmetic to F_p semantics; the two are consistent
+# if and only if the computation was already destined for ToBNAlgebra(p) at
+# the end.  Guarded via BNbracket's cleanup_field to enforce this.
+_field = None
+
+def set_field(p):
+    """Enable F_p arithmetic for simplify_decos (and thus mor addition).
+    Pass None to revert to Z.  Returns the previous value so callers can
+    restore it in a try/finally."""
+    global _field
+    prev = _field
+    _field = p
+    return prev
+
+def get_field():
+    return _field
+
 class obj(object):
     """A crossingless tangle (CLT) is a matching of n+m ends (m=top,n=bot=bottom). 
     arcs is a list whose ith entry gives the value of the involution at the ith tangle end."""
@@ -365,8 +392,10 @@ class mor(object):
     
     def ReduceDecorations(self):
         """delete all decorations in a cobordism ('self') that have a dot in the component containing the basepoint (the TEI 0)."""
-        r=self
-        ReducedDecorations = [deco for deco in self.decos if deco[find_first_index(self.comps,contains_0)+1] == 0]
+        # Hoist the base-point component lookup out of the per-decoration
+        # comprehension (it depends only on self.comps, not on deco).
+        basepoint_pos = find_first_index(self.comps, contains_0) + 1
+        ReducedDecorations = [deco for deco in self.decos if deco[basepoint_pos] == 0]
         if ReducedDecorations == []:
             return 0
         else:
@@ -453,13 +482,19 @@ def clt_back_arcs(components):
     return arc_to_involution(clt_back_pairs(components))
 
 def simplify_decos(decos):
-    """simplify decos by adding all coeffients of the same decoration, omitting those with coefficient 0."""
+    """simplify decos by adding all coeffients of the same decoration, omitting those with coefficient 0.
+    If the module-level _field is set to a prime p, coefficients are reduced mod p before zero-testing."""
     if decos == []:
-        return []    
+        return []
     def droplast(l):
         return l[:-1]
-    def add_coeffs(l):
-        return sum([element[-1] for element in l])
+    p = _field
+    if p is not None and p > 1:
+        def add_coeffs(l):
+            return sum(element[-1] for element in l) % p
+    else:
+        def add_coeffs(l):
+            return sum(element[-1] for element in l)
     return [x for x in \
         [decos_without_coeff+[add_coeffs(list(grouped))] \
         for decos_without_coeff,grouped in groupby(sorted(decos),droplast)] \

@@ -306,9 +306,12 @@ class mor(object):
                     string += coeff + "id"
         return string
     
-    def ToCob(self, sourceCLT, targetCLT):# does not work yet, since Z is not implemented over BNAlgebra and Cob is only implemented over Z.
-        if self.field != 1:
-            raise Exception("You are converting a morphism in BNalgebra with coefficients in field={} into a morphism in Cob. However, the category Cob is only implemented over integers, ie for field=1.".format(field))
+    def ToCob(self, sourceCLT, targetCLT):
+        """Convert a BN-algebra morphism to a Cob morphism between the two
+        given (1,3)-CLTs.  Coefficients are treated as integers; for a BN
+        complex over F_p (p>1) the caller is responsible for downstream
+        mod-p interpretation.
+        """
         decos = []
         
         for pair in self.pairs:

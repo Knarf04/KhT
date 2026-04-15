@@ -364,20 +364,33 @@ class BNComplex(object):
         
         return BNComplex(self.gens+shifted_complex.gens,new_diff,self.field)
     
-    def ToCob(self):# does not work yet, since Z is not implemented over BNAlgebra and Cob is only implemented over Z.
-        if self.field != 1:
-            raise Exception("You are converting a complex over BNalgebra with coefficients in field={} into a complex over Cob. However, the category Cob is only implemented over integers, ie for field=1.".format(field))
-        
-        gens = [obj.ToCob() for obj in BNcomplex.gens]
-        def convert(mor,source,target):
-            if mor == 0:
+    def ToCob(self):
+        """Convert a BNComplex back to a CobComplex.
+
+        The BN-algebra generators are mapped to their standard (1,3)-CLT
+        representatives and each BN-algebra morphism is expanded to a Cob
+        morphism.  For field == 1 (integer coefficients) this is a genuine
+        inverse of ToBNAlgebra.  For field == p > 1 the coefficients come
+        back as their canonical representatives in [0, p), which is
+        mathematically consistent provided subsequent computations stay in
+        F_p (i.e. the caller treats the returned Cob complex under mod-p
+        arithmetic).
+        """
+        gens = [g.ToCob() for g in self.gens]
+
+        def convert(m, source, target):
+            if m == 0:
                 return 0
-            return mor.ToCob(source,target)
-        diff = [[convert(mor, gens[source], gens[target]) for source, mor in enumerate(row)] for target, row in enumerate(BNcomplex.diff)]
-        complex = CobComplexes.CobComplex(gens, diff)
-        # complex.print("old long")
-        complex.validate()
-        return complex
+            return m.ToCob(source, target)
+
+        N = len(gens)
+        diff = np.zeros((N, N), dtype=object)
+        for t, row in enumerate(self.diff):
+            for s, m in enumerate(row):
+                if m == 0:
+                    continue
+                diff[t, s] = convert(m, gens[s], gens[t])
+        return CobComplexes.CobComplex(gens, diff)
     
 def importBNcx(filename):
     with open("examples/data/BNComplexes/"+filename, "r") as text_file:

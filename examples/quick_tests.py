@@ -351,6 +351,48 @@ check("cabled_5_1_F2 compsizes",                 _compsizes(BNcx), [12, 12, 12, 
 print("#  cabled_5_1_F2 wall={:.2f}s".format(time() - t11))
 
 
+# ---------- 12) F_p-aware Cob path (intermediate (1,3) cleanup) ------------
+#     Runs the same 2-cable-trefoil and cabled_5_1 computations but with
+#     cleanup_field=2 passed through to BNbracket.  This exercises
+#     BNComplex.ToCob (previously broken), the F_p simplify_decos branch in
+#     Cob, and the intermediate cleanup heuristics.  Final invariants must
+#     still match the Z-Cob path.
+
+t12 = time()
+tangle_2cable = ("cap1.cap2.cap3.neg1.neg2.neg0.neg1.pos3.pos2.pos4.pos3."
+                 "neg1.neg0.neg2.neg1.cup3.cup2")
+cx = BNbracket(tangle_2cable, 0, 0, 1, cleanup_field=2)
+BNr = cx.ToBNAlgebra(2)
+BNr.eliminateAll()
+BNr.clean_up()
+check_truthy("Fp_path_2cable validate", validate_ok(BNr))
+check_truthy("Fp_path_2cable looptype", BNr.is_looptype())
+check("Fp_path_2cable ngens",           len(BNr.gens), 27)
+check("Fp_path_2cable compsizes",       _compsizes(BNr), [12, 15])
+check("Fp_path_2cable gradings",        _grad(BNr), [
+    (-2, 0, -1.0), (-1, 1, -1.5), (1, 2, -1.5), (3, 3, -1.5),
+    (4, 4, -2.0), (5, 4, -1.5), (5, 5, -2.5), (6, 5, -2.0),
+    (6, 6, -3.0), (7, 6, -2.5), (7, 6, -2.5), (7, 7, -3.5),
+    (8, 7, -3.0), (9, 7, -2.5), (9, 7, -2.5), (9, 8, -3.5),
+    (9, 8, -3.5), (10, 8, -3.0), (11, 8, -2.5), (11, 9, -3.5),
+    (11, 9, -3.5), (12, 9, -3.0), (13, 10, -3.5), (13, 10, -3.5),
+    (14, 11, -4.0), (15, 11, -3.5), (16, 12, -4.0)])
+print("#  Fp_path_2cable wall={:.2f}s".format(time() - t12))
+
+t13 = time()
+T = Tangle.from_legacy("cup1.pos0.neg1.neg1.neg1.pos0.cap1", topends=1, botends=1).Cable()
+# Same computation as test 11 but with intermediate cleanup enabled.
+cx = BNbracket(T.slices, T.pos, T.neg, T.top, cleanup_field=2)
+BNcx = cx.ToBNAlgebra(2)
+BNcx.eliminateAll()
+BNcx.clean_up()
+check_truthy("Fp_path_cabled_5_1 validate", validate_ok(BNcx))
+check_truthy("Fp_path_cabled_5_1 looptype", BNcx.is_looptype())
+check("Fp_path_cabled_5_1 ngens",           len(BNcx.gens), 79)
+check("Fp_path_cabled_5_1 compsizes",       _compsizes(BNcx), [12, 12, 12, 12, 31])
+print("#  Fp_path_cabled_5_1 wall={:.2f}s".format(time() - t13))
+
+
 # ---------- Summary --------------------------------------------------------
 
 elapsed = time() - Suite.t_start
