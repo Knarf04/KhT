@@ -194,14 +194,49 @@ class BNComplex(object):
                         if pair[0]*face>0:# same face
                             self.isotopy(index,start,BNAlgebra.mor([[pair[0]-face,(-1)*pair[1]*inverse_coeff]],self.field),"unsafe")
     
-    def clean_up_once(self,SD):
+    def _pick_start_deterministic(self, remaining, SD):
+        """Pick the generator in `remaining` whose shortest outgoing SD-arrow
+        has the smallest power.  Ties break on lowest generator index.
+
+        This replaces ``choice(remaining)`` with a deterministic reduction
+        measure, enabling caching / reproducible benchmarks.  The measure
+        is the same quantity the inner arrow-shortening loop already
+        optimizes, so it should preserve convergence — though a formal
+        proof is still out of scope (see OPEN_QUESTIONS.md item 8).
+        """
+        best_gen = None
+        best_power = SD * math.inf
+        for start in remaining:
+            for end in remaining:
+                entry = self.diff[end, start]
+                if entry == 0:
+                    continue
+                for pair in entry.pairs:
+                    if pair[0] * SD > 0 and (best_power - pair[0]) * SD > 0:
+                        best_power = pair[0]
+                        best_gen = start
+        if best_gen is None:
+            # No arrows of this face anywhere in `remaining`; fall back to
+            # the lowest-index generator so the outer loop can drop it.
+            return remaining[0]
+        return best_gen
+
+    def clean_up_once(self, SD, deterministic=False):
         """ Simplify complex wrt the face D (1) or S (-1).
+
+        When ``deterministic`` is True, the starting generator on each
+        outer iteration is chosen by :meth:`_pick_start_deterministic`
+        instead of ``random.choice``.  Default remains ``False`` so
+        historical benchmarks are unchanged.
         """
         remaining=list(range(len(self.gens))) # list of unsimplified generators
-        
+
         while remaining !=[]:
             #print(remaining)
-            start_current=choice(remaining)
+            if deterministic:
+                start_current = self._pick_start_deterministic(remaining, SD)
+            else:
+                start_current=choice(remaining)
             #print(start_current)
             end_current = -1
             index_current = -1
@@ -308,10 +343,14 @@ class BNComplex(object):
         diffs=[[[self.diff[j,i] for j in curve] for i in curve] for curve in curves]
         return multicurve([BNComplex(gens,diff,self.field) for gens,diff in zip(genss,diffs)])
         
-    def clean_up(self,max_iter=1000):
-        """ Simplify complex alternatingly wrt D and S faces and stop after at most max_iter iterations. The default is 200 iterations. 
+    def clean_up(self, max_iter=1000, deterministic=False):
+        """ Simplify complex alternatingly wrt D and S faces and stop after at most max_iter iterations. The default is 200 iterations.
+
+        Pass ``deterministic=True`` to replace the randomised start
+        selection in :meth:`clean_up_once` with a reduction-measure-based
+        choice (see OPEN_QUESTIONS.md item 8).
         """
-        
+
         iter=0
         time0=time()
         time1=time0
@@ -321,8 +360,8 @@ class BNComplex(object):
                     print("Clean-Up: Finished after "+str(iter)+" iteration(s) in "+str(round(time1-time0,1))+" second(s).")
                     break
             iter+=1
-            self.clean_up_once(-1)# faces S
-            self.clean_up_once(1) # faces D
+            self.clean_up_once(-1, deterministic=deterministic)# faces S
+            self.clean_up_once(1, deterministic=deterministic) # faces D
             time2=time()
             print("iteration: "+str(iter)+" ("+str(round(time2-time1,1))+" sec)", end='\r')# testing how to monitor a process
             time1=time2
@@ -364,24 +403,25 @@ class BNComplex(object):
         
         return BNComplex(self.gens+shifted_complex.gens,new_diff,self.field)
     
-    def ToCob(self):
+    def ToCob(self, signed_lift=False):
         """Convert a BNComplex back to a CobComplex.
 
         The BN-algebra generators are mapped to their standard (1,3)-CLT
         representatives and each BN-algebra morphism is expanded to a Cob
         morphism.  For field == 1 (integer coefficients) this is a genuine
         inverse of ToBNAlgebra.  For field == p > 1 the coefficients come
-        back as their canonical representatives in [0, p), which is
-        mathematically consistent provided subsequent computations stay in
-        F_p (i.e. the caller treats the returned Cob complex under mod-p
-        arithmetic).
+        back as their canonical representatives in [0, p) by default, or
+        in (-p/2, p/2] when ``signed_lift=True`` is passed (OPEN_QUESTIONS
+        item 1 — which lift the downstream Cob identities prefer is an
+        open math question, so this is opt-in).
         """
         gens = [g.ToCob() for g in self.gens]
+        field = self.field
 
         def convert(m, source, target):
             if m == 0:
                 return 0
-            return m.ToCob(source, target)
+            return m.ToCob(source, target, signed_lift=signed_lift, field=field)
 
         N = len(gens)
         diff = np.zeros((N, N), dtype=object)
@@ -409,7 +449,10 @@ class multicurve(object):
         return "multicurve({})".format(self.comps)
     
     def save(self,name):
-        with open(filepath+"BNComplexes/"+name, "w") as text_file:
+        import os as _os
+        out_path = filepath+"BNComplexes/"+name
+        _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
+        with open(out_path, "w") as text_file:
             print(repr(self), file=text_file)
     
     def draw(self, name, vertex_switch="qhdelta",title=["",""],tangle=None,thumbnails=False):

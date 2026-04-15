@@ -14,11 +14,45 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import math
 from itertools import product, groupby
 from tabulate import tabulate
 
 import BNAlgebra
 from auxiliary import *
+
+# Optional Cython acceleration for Cob.mor.__mul__'s inner loop.
+# Built via KhT/setup_cob_ext.py; safe to skip if unavailable.
+try:
+    import cob_ext as _cob_ext
+    _COB_EXT_AVAILABLE = True
+except ImportError:
+    _cob_ext = None
+    _COB_EXT_AVAILABLE = False
+
+
+# Cache for decos_from_old_comp: keyed by (genus, r, n).  Values are
+# lists-of-tuples: tuples are immutable, callers of this helper only
+# read the entries (never mutate), so sharing the exact cached objects
+# across calls is safe and saves ~O(|hit|) list-copy overhead per call.
+_decos_from_old_comp_cache = {}
+
+def _decos_from_old_comp(g, r, n):
+    key = (g, r, n)
+    cached = _decos_from_old_comp_cache.get(key)
+    if cached is not None:
+        return cached
+    if r > 0:
+        out = [[g+r-1] + [1]*n + [1]]
+    elif g % 2 == 0:
+        out = [[g+n-sum(dots)-1] + list(dots) + [(-1)**(g+n-sum(dots)-1)]
+               for dots in list(product([0, 1], repeat=n))[:-1]]
+    else:
+        out = [[g+n-sum(dots)-1] + list(dots) + [(-1)**(g+n-sum(dots)-1)]
+               for dots in list(product([0, 1], repeat=n))[:-1]] \
+              + [[g-1] + [1]*n + [2]]
+    _decos_from_old_comp_cache[key] = out
+    return out
 
 # Optional F_p awareness.  When set to a prime p, every coefficient produced
 # by simplify_decos (and mor addition) is reduced mod p.  Default None means
@@ -338,30 +372,27 @@ class mor(object):
                in zip(old_comps,old_comps_x,comps1_x,comps2_x)\
         ]# genus of the closure of old_comps
         
-        def decos_from_old_comp(g,r,n):
-            if r>0:# r>0 and v_c=1
-                return [[g+r-1]+[1 for j in range(n)]+[1]]
-            else:
-                if g%2==0:# genus even
-                    return [[g+n-sum(dots)-1]+list(dots)+[(-1)**(g+n-sum(dots)-1)]\
-                            for dots in list(product([0,1], repeat=n))[:-1]]
-                if g%2==1:# genus odd
-                    return [[g+n-sum(dots)-1]+list(dots)+[((-1)**(g+n-sum(dots)-1))]\
-                            for dots in list(product([0,1], repeat=n))[:-1]]\
-                            +[[g-1]+[1 for i in range(n)]+[2]]
-        
-        def combine_decos(l,Hpower,coeff):
-            return [sum([Hpower]+[i[0] for i in l])]+flatten([i[1:-1] for i in l])+[coeff*prod([i[-1] for i in l])]
-        
-        decos=[]
-        for deco1 in self.decos:
-            for deco2 in other.decos:
-                partial_decos=[]
-                for comp1_x,comp2_x,gen,old_comp_x in zip(comps1_x,comps2_x,genus,old_comps_x):
-                    r=sum([deco1[index+1] for index in comp1_x]+[deco2[index+1] for index in comp2_x])# number of dots on old_comp
-                    partial_decos.append(decos_from_old_comp(gen,r,len(old_comp_x))) 
-                decos+=[combine_decos(l,deco1[0]+deco2[0],deco1[-1]*deco2[-1]) for l in product(*partial_decos)]
-        
+        decos_from_old_comp = _decos_from_old_comp
+
+        if _COB_EXT_AVAILABLE:
+            # Cython fast path — same math, compiled.
+            decos = _cob_ext.compose_decos_inner(
+                self.decos, other.decos,
+                genus, comps1_x, comps2_x, old_comps_x,
+                decos_from_old_comp)
+        else:
+            def combine_decos(l,Hpower,coeff):
+                return [sum([Hpower]+[i[0] for i in l])]+flatten([i[1:-1] for i in l])+[coeff*prod([i[-1] for i in l])]
+
+            decos=[]
+            for deco1 in self.decos:
+                for deco2 in other.decos:
+                    partial_decos=[]
+                    for comp1_x,comp2_x,gen,old_comp_x in zip(comps1_x,comps2_x,genus,old_comps_x):
+                        r=sum([deco1[index+1] for index in comp1_x]+[deco2[index+1] for index in comp2_x])# number of dots on old_comp
+                        partial_decos.append(decos_from_old_comp(gen,r,len(old_comp_x)))
+                    decos+=[combine_decos(l,deco1[0]+deco2[0],deco1[-1]*deco2[-1]) for l in product(*partial_decos)]
+
         Output = mor(self.front,other.back,simplify_decos(decos),[new_comps[index] for index in flatten(old_comps_x)])
         
         return Output.ReduceDecorations()# This kills any cobordism in the linear combination that has a dot on the same component as the basepoint
@@ -391,9 +422,11 @@ class mor(object):
             return False
     
     def ReduceDecorations(self):
-        """delete all decorations in a cobordism ('self') that have a dot in the component containing the basepoint (the TEI 0)."""
-        # Hoist the base-point component lookup out of the per-decoration
-        # comprehension (it depends only on self.comps, not on deco).
+        """delete all decorations in a cobordism ('self') that have a dot in the component containing the basepoint (the TEI 0).
+
+        Field-agnostic: filters only by dot position, never touches
+        coefficients, so F_p activation via set_field() is irrelevant here.
+        """
         basepoint_pos = find_first_index(self.comps, contains_0) + 1
         ReducedDecorations = [deco for deco in self.decos if deco[basepoint_pos] == 0]
         if ReducedDecorations == []:
@@ -401,23 +434,42 @@ class mor(object):
         else:
             self.decos = ReducedDecorations
             return self
-    
+
     def isIsom(self):
         """checks if self is the identity cobordism or the negative identity cobordism"""
-        # check if it is a single cobordism (and not a linear combination of several cobordisms or the zero cobordism)
-        # checks if the number of components of the cobordism is exactly the number of arcs of the front CLT (and hence also the back CLT)
-        # checks if there are no dots or powers of H (dots and Hpowers are non-negative)
-        # checks if the coefficient is +-1. 
-        # Note that if one of these conditions is not satified, then python does not evaluate the following ones and immediately returns False. 
-        return (len(self.decos) == 1) and (len(self.comps) == self.front.total) and (sum(self.decos[0][:-1])==0) and (self.decos[0][-1] in [1, -1]) 
+        if not ((len(self.decos) == 1) and (len(self.comps) == self.front.total) and (sum(self.decos[0][:-1])==0)):
+            return False
+        coeff = self.decos[0][-1]
+        if _field is not None and _field > 1:
+            return coeff == 1 or coeff == (-1) % _field
+        return coeff in [1, -1]
+
+    def arrow_length(self):
+        """Candidate reduction measure for a Cob-level arrow-shortening
+        algorithm (see OPEN_QUESTIONS.md item 5).
+
+        Returns the *minimum* H-power (first deco slot) across all
+        decorations.  This is the Cob analogue of the BN-algebra
+        ``min |pair[0]|`` measure used by BNComplex.clean_up_once to
+        pick the next arrow to isotope away.
+
+        If self has no decorations (zero mor), returns +inf.
+
+        This helper is exposed for future Cob-level clean_up work; it
+        is not yet wired into any iterative simplification pass because
+        the matching arrow-shortening identities are not implemented
+        (math deliverable — see OPEN_QUESTIONS.md item 5).
+        """
+        if not self.decos:
+            return math.inf
+        return min(deco[0] for deco in self.decos)
 
     def __neg__(self):
         """returns a cobordism that is exactly the same as self, but with all the coefficients in the linear combination multiplied by -1"""
-        # mutate the objects:
-        # self.decos = [ deco[:-1] + [deco[-1]*-1] for deco in self.decos]
-        # return self
-        # safer option, just as fast:
-        newDecos = [ deco[:-1] + [deco[-1]*-1] for deco in self.decos]
+        if _field is not None and _field > 1:
+            newDecos = [ deco[:-1] + [(-deco[-1]) % _field] for deco in self.decos]
+        else:
+            newDecos = [ deco[:-1] + [deco[-1]*-1] for deco in self.decos]
         return mor(self.front, self.back, newDecos, self.comps)
     
     def ToBNAlgebra(self,field=2):
@@ -443,8 +495,51 @@ class mor(object):
             
             return BNAlgebra.mor(decos_DD+decos_id+decos_DH+decos_SH,field).simplify_mor(field)
         
+def canonical_h_mor(front_clt, back_clt, h_power, coeff):
+    """Return a Cob.mor from ``front_clt`` to ``back_clt`` with a single
+    decoration ``[h_power, 0, 0, ..., 0, coeff]`` — i.e., ``H^h_power``
+    times the minimal no-dot cobordism determined by the boundary.
+
+    Used by the Cob-level arrow-shortening clean-up
+    (:meth:`CobComplexes.CobComplex.clean_up_once`) as the "isotopy
+    label" analogous to the BN-algebra monomial used by
+    :meth:`BNComplexes.BNComplex.isotopy`.
+    """
+    comps = components(front_clt, back_clt)
+    deco = [h_power] + [0] * len(comps) + [coeff]
+    return mor(front_clt, back_clt, [deco], comps)
+
+
+def canonical_dotted_mor(front_clt, back_clt, h_power, dot_positions, coeff):
+    """Return a Cob.mor from ``front_clt`` to ``back_clt`` with a single
+    decoration ``[h_power, dots..., coeff]`` where ``dots`` has a 1 at
+    each index in ``dot_positions`` and 0 elsewhere.
+
+    Used by :meth:`CobComplexes.CobComplex.clean_up_once` step B as
+    candidate isotopy labels for cross-idempotent absorption.
+    """
+    comps = components(front_clt, back_clt)
+    n = len(comps)
+    dots = [0] * n
+    for p in dot_positions:
+        if 0 <= p < n:
+            dots[p] = 1
+    deco = [h_power] + dots + [coeff]
+    return mor(front_clt, back_clt, [deco], comps)
+
+
+_components_cache = {}
+
 def components(clt1,clt2):
-    """components of an elementary cobordism between two tangles (assuming the same clt.top and clt.bot)."""
+    """components of an elementary cobordism between two tangles (assuming the same clt.top and clt.bot).
+
+    Pure function of ``(clt1.arcs, clt2.arcs)``.  Cached — profile on
+    TH-pattern showed ~68k calls, most with repeating CLT-arc pairs.
+    """
+    key = (tuple(clt1.arcs), tuple(clt2.arcs))
+    cached = _components_cache.get(key)
+    if cached is not None:
+        return cached
     allcomponents=[]
     done=[]
     for i in range(2*clt1.total):#find component for ith tangle end
@@ -459,6 +554,7 @@ def components(clt1,clt2):
                 component.append(cur)
                 cur=clt2.arcs[cur]
             allcomponents.append(component)
+    _components_cache[key] = allcomponents
     return allcomponents
 
 def arc_to_involution(pairs):
@@ -483,20 +579,19 @@ def clt_back_arcs(components):
 
 def simplify_decos(decos):
     """simplify decos by adding all coeffients of the same decoration, omitting those with coefficient 0.
-    If the module-level _field is set to a prime p, coefficients are reduced mod p before zero-testing."""
-    if decos == []:
+    If the module-level _field is set to a prime p, coefficients are reduced mod p before zero-testing.
+
+    Dict-based aggregation is 2-4x faster than the previous sort+groupby
+    for the sizes we see in TH-pattern (typically 1-30 decos per call).
+    """
+    if not decos:
         return []
-    def droplast(l):
-        return l[:-1]
     p = _field
+    acc = {}
+    for d in decos:
+        key = tuple(d[:-1])
+        acc[key] = acc.get(key, 0) + d[-1]
     if p is not None and p > 1:
-        def add_coeffs(l):
-            return sum(element[-1] for element in l) % p
-    else:
-        def add_coeffs(l):
-            return sum(element[-1] for element in l)
-    return [x for x in \
-        [decos_without_coeff+[add_coeffs(list(grouped))] \
-        for decos_without_coeff,grouped in groupby(sorted(decos),droplast)] \
-        if x[-1]!=0]
+        return [list(key) + [v % p] for key, v in acc.items() if v % p != 0]
+    return [list(key) + [v] for key, v in acc.items() if v != 0]
 

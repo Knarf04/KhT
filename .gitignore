@@ -6,3 +6,8 @@ __pycache__
 output.txt
 output
 
+# Cython build artifacts (generated from cob_ext.pyx by setup_cob_ext.py)
+KhT/cob_ext.c
+KhT/cob_ext*.so
+KhT/build/
+

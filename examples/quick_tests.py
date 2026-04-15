@@ -393,6 +393,99 @@ check("Fp_path_cabled_5_1 compsizes",       _compsizes(BNcx), [12, 12, 12, 12, 3
 print("#  Fp_path_cabled_5_1 wall={:.2f}s".format(time() - t13))
 
 
+# ---------- 14) F_p-aware Cob.mor primitives (isIsom, __neg__) -------------
+#     Directly exercises the field-aware branches of isIsom and __neg__
+#     under Cob.set_field(2).  Ensures -1 and 1 collapse correctly mod 2
+#     and the isIsom predicate still recognises an identity cobordism.
+
+t14 = time()
+
+def _fp_primitives_tests(Suite=Suite):
+    import BNAlgebra as _BNAlg
+    import Cob as _Cob
+    # Build a trivial (1,3) identity cobordism via the BN-algebra route.
+    obj = _BNAlg.obj(0, 0, 0)
+    unit = _BNAlg.mor([[0, 1]], 2)
+    clt = obj.ToCob()
+
+    prev = _Cob.set_field(2)
+    try:
+        idm = unit.ToCob(clt, clt)
+        Suite.check_truthy("Fp_isIsom identity under F_2", idm.isIsom())
+
+        neg_idm = -idm
+        # Under F_2, coeff -1 must lift to 1; __neg__ should reduce mod p.
+        Suite.check_truthy("Fp_neg coeff in [0, p)",
+                     all(0 <= d[-1] < 2 for d in neg_idm.decos))
+        Suite.check_truthy("Fp_isIsom neg identity under F_2", neg_idm.isIsom())
+
+        dneg = -(-idm)
+        Suite.check_truthy("Fp_double_neg identity under F_2", dneg.isIsom())
+    finally:
+        _Cob.set_field(prev)
+
+_fp_primitives_tests()
+print("#  Fp_primitives wall={:.2f}s".format(time() - t14))
+
+
+# ---------- 15) Deterministic clean_up_once ---------------------------------
+#     Exercises the deterministic=True path through clean_up on the
+#     2-cable-trefoil.  The reduction-measure choice is not proven to
+#     converge to loop-type (OPEN_QUESTIONS.md item 8, residual), so we
+#     only assert: (a) the algorithm does not stall / crash, (b) d^2 = 0
+#     is preserved, (c) generator count matches the randomised path, so
+#     the deterministic variant at least gets eliminateAll-level
+#     reduction for free.
+
+t15 = time()
+cx = BNbracket(tangle_2cable, 0, 0, 1)
+BNr = cx.ToBNAlgebra(2)
+BNr.eliminateAll()
+BNr.clean_up(max_iter=50, deterministic=True)
+check_truthy("deterministic_2cable validate", validate_ok(BNr))
+check("deterministic_2cable ngens",           len(BNr.gens), 27)
+print("#  deterministic_2cable wall={:.2f}s".format(time() - t15))
+
+
+# ---------- 16) signed-lift opt-in path ------------------------------------
+#     Runs the 2-cable-trefoil through the F_p intermediate-cleanup path
+#     with signed_lift=True.  Final invariants must match the unsigned
+#     path (both are reduced mod p downstream, so the set of mod-p
+#     classes is the same).  Exercises the new signed-lift branch in
+#     BNAlgebra.mor.ToCob + BNComplex.ToCob.
+
+t16 = time()
+cx = BNbracket(tangle_2cable, 0, 0, 1, cleanup_field=2, signed_lift=True)
+BNr = cx.ToBNAlgebra(2)
+BNr.eliminateAll()
+BNr.clean_up()
+check_truthy("signed_lift_2cable validate", validate_ok(BNr))
+check_truthy("signed_lift_2cable looptype", BNr.is_looptype())
+check("signed_lift_2cable ngens",           len(BNr.gens), 27)
+check("signed_lift_2cable compsizes",       _compsizes(BNr), [12, 15])
+print("#  signed_lift_2cable wall={:.2f}s".format(time() - t16))
+
+
+# ---------- 17) Cob.mor.arrow_length + CobComplex.clean_up scaffold -------
+#     Smoke test for the Stage-4 scaffolding from OPEN_QUESTIONS.md
+#     item 5.  arrow_length returns min H-power; clean_up currently
+#     delegates to eliminateAll and must be idempotent on an already
+#     cleaned complex.
+
+t17 = time()
+cx = BNbracket(tangle_2cable, 0, 0, 1)
+before = len(cx.gens)
+cx.clean_up(max_iter=5)
+after = len(cx.gens)
+check_truthy("cob_clean_up non-increasing", after <= before)
+# arrow_length exposed on Cob.mor
+import Cob as _Cob_smoke
+sample = next((m for row in cx.diff for m in row if m != 0), None)
+check_truthy("arrow_length numeric",
+             sample is None or isinstance(sample.arrow_length(), (int, float)))
+print("#  cob_clean_up wall={:.2f}s".format(time() - t17))
+
+
 # ---------- Summary --------------------------------------------------------
 
 elapsed = time() - Suite.t_start

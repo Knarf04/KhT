@@ -154,7 +154,44 @@ def coeff_simplify(num,field): # Returns num mod p if field is a prime p, otherw
     if field > 1:
         return num % field
     else: # This probably needs to be fixed for field=0
-        return num 
+        return num
+
+# OPEN_QUESTIONS.md item 3: cabled knots 5_1, 5_2, 6_1 fail d^2 = 0 over
+# F_3, F_5, F_7.  The most likely culprit is a sign mismatch between the
+# even-negative and odd-negative branches of mor.ToCob.  Setting
+# _sign_convention = "corrected" flips the sign on the D-term in the
+# even-negative branch.  Keep "legacy" as the default so historical
+# outputs are unchanged; "corrected" is experimental and not yet
+# mathematically verified.
+_sign_convention = "legacy"
+
+def set_sign_convention(convention):
+    """Flip between legacy and experimental sign conventions in
+    mor.ToCob (see OPEN_QUESTIONS.md item 3).  Returns the previous
+    value so callers can restore it in a try/finally."""
+    global _sign_convention
+    if convention not in ("legacy", "corrected"):
+        raise ValueError("sign_convention must be 'legacy' or 'corrected'")
+    prev = _sign_convention
+    _sign_convention = convention
+    return prev
+
+def signed_lift_coeff(num, field):
+    """Centered representative of ``num`` modulo ``field``.
+
+    Maps [0, p) to (-p/2, p/2]; pass-through when field <= 1.
+    Used when converting BN-algebra coefficients back to Cob, where
+    downstream Cob identities might prefer a signed lift.  See
+    OPEN_QUESTIONS.md item 1 — the math question of which lift makes
+    which identities hold is open, so this is opt-in via a flag.
+    """
+    if field is None or field <= 1:
+        return num
+    reduced = num % field
+    half = field // 2
+    if reduced > half:
+        return reduced - field
+    return reduced
 
 class mor(object):
     """An element of Bar-Natan's algebra is a list of pairs [power,coeff]
@@ -306,27 +343,47 @@ class mor(object):
                     string += coeff + "id"
         return string
     
-    def ToCob(self, sourceCLT, targetCLT):
+    def ToCob(self, sourceCLT, targetCLT, signed_lift=False, field=None):
         """Convert a BN-algebra morphism to a Cob morphism between the two
-        given (1,3)-CLTs.  Coefficients are treated as integers; for a BN
-        complex over F_p (p>1) the caller is responsible for downstream
-        mod-p interpretation.
+        given (1,3)-CLTs.
+
+        When ``signed_lift`` is True and ``field`` is a prime > 1, each
+        BN coefficient is lifted to its centered representative in
+        (-p/2, p/2] before feeding into the Cob decos.  Default is the
+        historical unsigned lift in [0, p); see OPEN_QUESTIONS.md item 1
+        for the math question behind which lift is correct.
+
+        Hardcoded to (1, 3)-tangles.  Callers passing CLTs of a different
+        width will get a NotImplementedError — see OPEN_QUESTIONS.md item
+        7 for the math deliverable needed to generalize to (1, 2k+1).
         """
+        if not (sourceCLT.top == 1 and sourceCLT.bot == 3
+                and targetCLT.top == 1 and targetCLT.bot == 3):
+            raise NotImplementedError(
+                "BNAlgebra.mor.ToCob is specific to (1, 3)-tangles "
+                "(see OPEN_QUESTIONS.md item 7); got "
+                "source=({}, {}), target=({}, {})".format(
+                    sourceCLT.top, sourceCLT.bot,
+                    targetCLT.top, targetCLT.bot))
+        lift = (lambda c: signed_lift_coeff(c, field)) if signed_lift else (lambda c: c)
         decos = []
-        
+
         for pair in self.pairs:
-            if pair[0] > 0 : 
-                decos.append([pair[0]-1, 0, 1, pair[1]])
-            elif pair[0] == 0: 
-                decos.append([0, 0, 0, pair[1]])
+            c = lift(pair[1])
+            if pair[0] > 0 :
+                decos.append([pair[0]-1, 0, 1, c])
+            elif pair[0] == 0:
+                decos.append([0, 0, 0, c])
             elif pair[0] %2 == 0:
                 power = int(Fraction(-1*pair[0], 2))
-                decos.append([power, 0, 0, ((-1)** power) *pair[1]]) #(-H)^(n/2)
-                decos.append([power - 1, 0, 1, ((-1)** (power -1)) *pair[1]]) #(-H)^(n/2-1) D
-            elif pair[0] %2== 1: 
+                # "corrected" flips the D-term sign (OPEN_QUESTIONS item 3).
+                d_sign = ((-1) ** power) if _sign_convention == "corrected" else ((-1) ** (power - 1))
+                decos.append([power, 0, 0, ((-1)** power) * c]) #(-H)^(n/2)
+                decos.append([power - 1, 0, 1, d_sign * c]) #(-H)^(n/2-1) D
+            elif pair[0] %2== 1:
                 power = int(Fraction(-1*pair[0] -1, 2))
-                decos.append([power, 0, ((-1)** power)*pair[1] ])#(-H)^((n-1)/2) S
-            else: 
+                decos.append([power, 0, ((-1)** power) * c ])#(-H)^((n-1)/2) S
+            else:
                 raise Exception("pair is not an integer?")
         mor = Cob.mor(sourceCLT, targetCLT, decos)
         mor.ReduceDecorations()

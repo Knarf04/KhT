@@ -18,9 +18,52 @@ import numpy as np
 import pandas as pd
 from tabulate import tabulate
 from time import time
+import os
+import multiprocessing
 
 import Cob
 import BNComplexes
+
+
+# Module-level process pool for parallelizing the rank-1 update in
+# eliminateAll.  Created lazily on first use; shared across all
+# eliminateAll calls to amortize fork + startup cost.
+#
+# The pool's workers execute ``_parallel_mul_chunk`` — a simple wrapper
+# around Cob.mor.__mul__ that processes a batch of (i, j, iv, ov) tuples
+# to amortize per-task pickling overhead.  Threshold below which we fall
+# back to the serial path (parallelism overhead would dominate):
+#   ``nonzero_out * nonzero_in >= _PARALLEL_THRESHOLD``
+_POOL = None
+_POOL_SIZE = min(int(os.environ.get("KHT_WORKERS", os.cpu_count() or 1)),
+                 os.cpu_count() or 1)
+_PARALLEL_THRESHOLD = int(os.environ.get("KHT_PAR_THRESHOLD", "400"))
+_CHUNK_SIZE = int(os.environ.get("KHT_CHUNK", "32"))
+
+
+def _parallel_mul_chunk(chunk):
+    """Worker entry point: compute (i, j, iv * ov) for each tuple in chunk.
+
+    Workers run in forked processes, so they inherit the loaded Cob
+    module (and its cached tables).  Returns only nonzero deltas to
+    keep the pickle-back payload small.
+    """
+    out = []
+    for (i, j, iv, ov) in chunk:
+        delta = iv * ov
+        if delta != 0:
+            out.append((i, j, delta))
+    return out
+
+
+def _get_pool():
+    """Lazily create the module-level pool.  Fork start method keeps
+    the child processes cheap (no Python re-initialization)."""
+    global _POOL
+    if _POOL is None and _POOL_SIZE > 1:
+        ctx = multiprocessing.get_context("fork")
+        _POOL = ctx.Pool(_POOL_SIZE)
+    return _POOL
 
 class CobComplex(object):
     """ A chain complex is a directed graph, consisting of 
@@ -30,16 +73,58 @@ class CobComplex(object):
         Note that the matrix's rows and columns depend on the order the CLTS are given in the list 
         We assume that all entries of 'diff' are reduced in the sense that 'ReduceDecorations()' does not change them.
         """
-    __slots__ = 'gens','diff','field','_nnz'
+    __slots__ = 'gens','diff','field','_nnz','_row','_col'
 
-    def __init__(self,gens,diff,field=1):
+    def __init__(self,gens,diff,field=1,nnz_hint=None):
+        """Construct a chain complex.
+
+        ``nnz_hint``, if provided, must be an iterable of ``(target, source)``
+        index pairs listing every non-zero position in ``diff``.  When set,
+        the full matrix scan is skipped — constructors like
+        :func:`AddPosCrossing`, :func:`AddNegCrossing`, :func:`AddCup`, and
+        :func:`AddCap` already know exactly which cells they filled, so
+        passing a hint shaves O(N^2) per construction on wide tangles.
+        """
         self.gens = gens
         self.diff = np.array(diff)
         self.field = field # not implemented; assuming integer coefficients throughout
-        # Sparse index of non-zero positions.  Maintained incrementally by
-        # eliminateIsom so findIsom can skip the mostly-zero matrix cells.
-        self._nnz = {(i, j) for i, row in enumerate(self.diff)
-                     for j, cob in enumerate(row) if cob != 0}
+        self._nnz = set()
+        self._row = {}
+        self._col = {}
+        if nnz_hint is not None:
+            for (i, j) in nnz_hint:
+                self._nnz.add((i, j))
+                self._row.setdefault(i, set()).add(j)
+                self._col.setdefault(j, set()).add(i)
+        else:
+            for i, row in enumerate(self.diff):
+                for j, cob in enumerate(row):
+                    if cob != 0:
+                        self._nnz.add((i, j))
+                        self._row.setdefault(i, set()).add(j)
+                        self._col.setdefault(j, set()).add(i)
+
+    def _nnz_add(self, i, j):
+        if (i, j) in self._nnz:
+            return
+        self._nnz.add((i, j))
+        self._row.setdefault(i, set()).add(j)
+        self._col.setdefault(j, set()).add(i)
+
+    def _nnz_discard(self, i, j):
+        if (i, j) not in self._nnz:
+            return
+        self._nnz.discard((i, j))
+        r = self._row.get(i)
+        if r is not None:
+            r.discard(j)
+            if not r:
+                del self._row[i]
+        c = self._col.get(j)
+        if c is not None:
+            c.discard(i)
+            if not c:
+                del self._col[j]
     
     def __repr__(self):
         return "CobComplex({},{},{})".format(self.gens,[list(row) for row in self.diff],self.field)
@@ -160,14 +245,24 @@ class CobComplex(object):
         keep_mask[Max] = False
         self.diff = self.diff[keep_mask][:, keep_mask]
 
-        # Re-index _nnz: drop positions involving the deleted row/col and
-        # shift remaining indices down by 1 or 2 as appropriate.
+        # Re-index _nnz / _row / _col: drop positions involving the deleted
+        # row/col and shift remaining indices down by 1 or 2 as appropriate.
         def shift(k):
             if k < Min:  return k
             if k < Max:  return k - 1
             return k - 2
         self._nnz = {(shift(i), shift(j)) for (i, j) in self._nnz
                      if i != Min and i != Max and j != Min and j != Max}
+        self._row = {shift(t): {shift(s) for s in ss
+                                if s != Min and s != Max}
+                     for (t, ss) in self._row.items()
+                     if t != Min and t != Max}
+        self._row = {t: ss for (t, ss) in self._row.items() if ss}
+        self._col = {shift(s): {shift(t) for t in ts
+                                if t != Min and t != Max}
+                     for (s, ts) in self._col.items()
+                     if s != Min and s != Max}
+        self._col = {s: ts for (s, ts) in self._col.items() if ts}
 
         # Sparse rank-1 update:  diff[i, j] += in_target[j] * out_source[i].
         # Profiling a cabled-knot tangle shows in_target and out_source are
@@ -190,67 +285,126 @@ class CobComplex(object):
                 cur = self.diff[i, j]
                 if cur == 0:
                     self.diff[i, j] = delta
-                    self._nnz.add((i, j))
+                    self._nnz_add(i, j)
                 else:
                     new = cur + delta
                     self.diff[i, j] = new
                     if new == 0:
-                        self._nnz.discard((i, j))
+                        self._nnz_discard(i, j)
 
     def eliminateAll(self): #mutates self by eliminating isomorphisms as long as it can find one
-        """Batched variant.  Each iso's rank-1 update is applied immediately,
-        but the expensive row/col deletion (full matrix reallocation via
-        np.delete) is deferred until the end.  Isomorphism positions in
-        already-scheduled-for-deletion rows/cols are skipped by findIsom.
+        """Eliminate all rank-1 isomorphism arrows from the diff matrix.
+
+        Performance-critical path.  Two optimizations vs a naive scan:
+
+        1. **Batch-find per pass**: each outer pass scans ``_nnz`` ONCE
+           and collects every iso that exists, rather than restarting
+           the scan after each iso.  Non-conflicting isos (disjoint
+           row/col sets) get applied in sequence; conflicts queue for
+           the next pass.  On TH-pattern at width 13, reduces the find
+           phase from ~50% of runtime to near zero on later passes.
+
+        2. **Deferred matrix compaction**: row/col deletions are just
+           marked in the ``deleted`` set; the actual ``np.delete`` and
+           remapping happens once at the end.
         """
         deleted = set()
         while True:
-            # Find the next iso, ignoring positions involving deleted rows/cols.
-            found = None
+            # One full scan of _nnz: collect every iso position.
+            candidates = []
             for (ti, si) in self._nnz:
                 if ti in deleted or si in deleted:
                     continue
                 if self.diff[ti, si].isIsom():
-                    found = (si, ti)
-                    break
-            if found is None:
+                    candidates.append((si, ti))
+            if not candidates:
                 break
-            si, ti = found
-            Min = si if si < ti else ti
-            Max = si if si > ti else ti
-            flip_sign = self.diff[ti, si].decos[0][-1] == 1
 
-            # Collect sparse in_target / out_source, skipping deleted
-            # indices and the pivot's own row/col.
-            out_source_col = self.diff[:, si]
-            in_target_row  = self.diff[ti]
-            nonzero_out = [(i, v) for i, v in enumerate(out_source_col)
-                           if v != 0 and i != si and i != ti and i not in deleted]
-            nonzero_in = [(j, -v if flip_sign else v) for j, v in enumerate(in_target_row)
-                          if v != 0 and j != si and j != ti and j not in deleted]
+            # Apply non-conflicting isos in sequence.  Two isos conflict
+            # if they share Min/Max with any already-applied iso in this
+            # pass — applying one invalidates the "is iso" status of
+            # entries in those rows/cols.  Conflicts get deferred to
+            # the next pass.
+            applied = 0
+            touched = set()  # row/col indices whose arrows were modified this pass
+            for (si, ti) in candidates:
+                if si in deleted or ti in deleted:
+                    continue
+                # Conflict check: if this iso's pivot is in a row/col that
+                # another iso already modified this pass, re-verify.
+                if si in touched or ti in touched:
+                    cur_pivot = self.diff[ti, si]
+                    if cur_pivot == 0 or not cur_pivot.isIsom():
+                        continue  # no longer an iso after earlier updates
 
-            # Mark for deletion and prune _nnz of entries that touch them.
-            deleted.add(Min); deleted.add(Max)
-            if nonzero_out and nonzero_in:
-                # Sparse rank-1 update:  diff[i, j] += in_target[j] * out_source[i]
-                for i, ov in nonzero_out:
-                    for j, iv in nonzero_in:
-                        delta = iv * ov
-                        if delta == 0:
-                            continue
-                        cur = self.diff[i, j]
-                        if cur == 0:
-                            self.diff[i, j] = delta
-                            self._nnz.add((i, j))
-                        else:
-                            new = cur + delta
-                            self.diff[i, j] = new
-                            if new == 0:
-                                self._nnz.discard((i, j))
-            # Drop pivot row/col entries from _nnz so the next findIsom skip
-            # list stays accurate.
-            self._nnz = {(i, j) for (i, j) in self._nnz
-                         if i != Min and i != Max and j != Min and j != Max}
+                Min = si if si < ti else ti
+                Max = si if si > ti else ti
+                flip_sign = self.diff[ti, si].decos[0][-1] == 1
+
+                out_source_col = self.diff[:, si]
+                in_target_row  = self.diff[ti]
+                nonzero_out = [(i, v) for i, v in enumerate(out_source_col)
+                               if v != 0 and i != si and i != ti and i not in deleted]
+                nonzero_in = [(j, -v if flip_sign else v) for j, v in enumerate(in_target_row)
+                              if v != 0 and j != si and j != ti and j not in deleted]
+
+                deleted.add(Min); deleted.add(Max)
+                touched.add(Min); touched.add(Max)
+                if nonzero_out and nonzero_in:
+                    # Track touched indices for conflict-detection on the
+                    # next iso in this pass.
+                    for i, _ in nonzero_out: touched.add(i)
+                    for j, _ in nonzero_in:  touched.add(j)
+
+                    total_muls = len(nonzero_out) * len(nonzero_in)
+                    pool = _get_pool() if total_muls >= _PARALLEL_THRESHOLD else None
+
+                    if pool is None:
+                        # Serial path (small isos — parallel overhead would dominate).
+                        for i, ov in nonzero_out:
+                            for j, iv in nonzero_in:
+                                delta = iv * ov
+                                if delta == 0:
+                                    continue
+                                cur = self.diff[i, j]
+                                if cur == 0:
+                                    self.diff[i, j] = delta
+                                    self._nnz_add(i, j)
+                                else:
+                                    new = cur + delta
+                                    self.diff[i, j] = new
+                                    if new == 0:
+                                        self._nnz_discard(i, j)
+                    else:
+                        # Parallel path: batch mul computations into chunks,
+                        # farm out to workers, apply results serially.
+                        tasks = [(i, j, iv, ov)
+                                 for (i, ov) in nonzero_out
+                                 for (j, iv) in nonzero_in]
+                        chunks = [tasks[k:k+_CHUNK_SIZE]
+                                  for k in range(0, len(tasks), _CHUNK_SIZE)]
+                        for chunk_result in pool.imap_unordered(
+                                _parallel_mul_chunk, chunks):
+                            for (i, j, delta) in chunk_result:
+                                cur = self.diff[i, j]
+                                if cur == 0:
+                                    self.diff[i, j] = delta
+                                    self._nnz_add(i, j)
+                                else:
+                                    new = cur + delta
+                                    self.diff[i, j] = new
+                                    if new == 0:
+                                        self._nnz_discard(i, j)
+                # Prune pivot row/col from _nnz.
+                for t in (Min, Max):
+                    for j in list(self._row.get(t, ())):
+                        self._nnz_discard(t, j)
+                    for i in list(self._col.get(t, ())):
+                        self._nnz_discard(i, t)
+                applied += 1
+
+            if applied == 0:
+                break
 
         # Compact: drop all deleted rows/cols in one numpy allocation.
         if deleted:
@@ -260,13 +414,312 @@ class CobComplex(object):
                 keep_mask[k] = False
             self.diff = self.diff[keep_mask][:, keep_mask]
             self.gens = [g for i, g in enumerate(self.gens) if i not in deleted]
-            # Remap _nnz indices to the compacted matrix
+            # Remap _nnz / _row / _col indices to the compacted matrix.
             deleted_sorted = sorted(deleted)
             import bisect
             def shift(k):
                 return k - bisect.bisect_left(deleted_sorted, k)
             self._nnz = {(shift(i), shift(j)) for (i, j) in self._nnz}
+            self._row = {shift(t): {shift(s) for s in ss} for (t, ss) in self._row.items()}
+            self._col = {shift(s): {shift(t) for t in ts} for (s, ts) in self._col.items()}
     
+    def _nnz_by_col(self):
+        """Dict source -> sorted list of targets for nonzero diff[target, source]."""
+        d = {}
+        for (t, s) in self._nnz:
+            d.setdefault(s, []).append(t)
+        for v in d.values():
+            v.sort()
+        return d
+
+    def _nnz_by_row(self):
+        """Dict target -> sorted list of sources for nonzero diff[target, source]."""
+        d = {}
+        for (t, s) in self._nnz:
+            d.setdefault(t, []).append(s)
+        for v in d.values():
+            v.sort()
+        return d
+
+    def _nnz_targets_of(self, source):
+        """Set of targets t with diff[t, source] != 0."""
+        return {t for (t, s) in self._nnz if s == source}
+
+    def _cob_isotopy(self, start, end, alg, col_idx, row_idx, entropy_guard=True):
+        """Apply a chain-homotopy-equivalence isotopy along the arrow
+        ``start → end`` labeled by Cob.mor ``alg``, iterating only over
+        the pre-computed non-zero row/column indices.
+
+        ``col_idx`` maps source -> list of targets (rows nonzero in a column).
+
+        If ``entropy_guard=True`` (default), the method first computes all
+        affected entries tentatively, then commits only if the total
+        decoration count of the touched entries does not increase.
+        This turns the absorption into a *monotone* reduction of deco
+        count, preventing the super-linear blowup observed when blindly
+        applying every candidate isotopy (see OPEN_QUESTIONS item 5 —
+        the BN-algebra version converges without this guard because of
+        the (1,3) algebra's finite structure; at wider widths the
+        isotopy's "collateral decorations" can explode).
+
+        Returns True if the isotopy was committed, False if skipped.
+        """
+        alg_neg = -alg
+        def _deco_count(entry):
+            return 0 if entry == 0 else len(entry.decos)
+
+        # Read iteration sets from self._nnz LIVE (not from the passed
+        # col_idx/row_idx), so that earlier isotopies in the same pass
+        # don't leave us with stale iteration sets — that would miss
+        # updates and break d^2 = 0.
+        sources_into_start = [s for (t, s) in self._nnz if t == start]
+        targets_from_end = [t for (t, s) in self._nnz if s == end]
+
+        # Phase A analogue: diff[end, s] += diff[start, s] * alg_neg
+        # for each source s with an arrow s -> start.
+        new_row = {}  # (end, s) -> new mor
+        for s in sources_into_start:
+            entry = self.diff[start, s]
+            if entry == 0:
+                continue
+            addend = entry * alg_neg
+            if addend == 0:
+                continue
+            cur = self.diff[end, s]
+            new_row[(end, s)] = addend if cur == 0 else cur + addend
+
+        # Phase B analogue: diff[t, start] += alg * diff[t, end]
+        # for each target t with an arrow end -> t.
+        new_col = {}  # (t, start) -> new mor
+        for t in targets_from_end:
+            entry = self.diff[t, end]
+            if entry == 0:
+                continue
+            addend = alg * entry
+            if addend == 0:
+                continue
+            cur = self.diff[t, start]
+            new_col[(t, start)] = addend if cur == 0 else cur + addend
+
+        if entropy_guard:
+            before = 0
+            after = 0
+            for (i, j) in new_row:
+                before += _deco_count(self.diff[i, j])
+                after += _deco_count(new_row[(i, j)])
+            for (i, j) in new_col:
+                before += _deco_count(self.diff[i, j])
+                after += _deco_count(new_col[(i, j)])
+            if after > before:
+                return False
+
+        # Commit.
+        for (i, j), new in new_row.items():
+            self.diff[i, j] = new
+            if new == 0:
+                self._nnz_discard(i, j)
+            else:
+                self._nnz_add(i, j)
+        for (i, j), new in new_col.items():
+            self.diff[i, j] = new
+            if new == 0:
+                self._nnz_discard(i, j)
+            else:
+                self._nnz_add(i, j)
+        return True
+
+    def _cob_isolate_h_arrow(self, start, end, col_idx, row_idx):
+        """Attempt Cob-level arrow-shortening from ``start → end``.
+
+        Generalization of the (1,3) BN-algebra ``isolate_arrow`` to Cob
+        at arbitrary width, covering **same-face absorption** including
+        dotted decorations (OPEN_QUESTIONS item 5, step A).
+
+        For each dot-pattern ``P`` appearing on a ``±1``-coeff deco of
+        ``self.diff[end, start]``, the deco with minimum H-power becomes
+        the "canonical short" arrow for that pattern.  Then, for each
+        other arrow ``diff[index, start]`` (index ≠ end, with
+        ``diff[index, end] == 0`` for isotopy safety), any deco sharing
+        dot-pattern ``P`` and H-power ≥ short's gets a tentative
+        absorption via a pure-H-power isotopy label.
+
+        Cross-idempotent saddle shortening (dot pattern shifts across
+        CLTs) is step B and not yet implemented.  The entropy guard
+        inside :meth:`_cob_isotopy` handles the cases where composition
+        through neck-cutting would produce more decoration than it
+        removes — those isotopies get skipped.
+
+        Returns the number of committed absorptions.
+        """
+        arrow = self.diff[end, start]
+        if arrow == 0:
+            return 0
+        field = Cob.get_field()
+        if field is not None and field > 1:
+            minus_one = (-1) % field
+        else:
+            minus_one = -1
+
+        # Group arrow's ±1-coeff decos by dot pattern; keep the shortest H.
+        by_pattern = {}  # tuple(dots) -> (short_H, short_coeff)
+        for d in arrow.decos:
+            if d[-1] != 1 and d[-1] != minus_one:
+                continue
+            pat = tuple(d[1:-1])
+            if pat not in by_pattern or d[0] < by_pattern[pat][0]:
+                by_pattern[pat] = (d[0], d[-1])
+        if not by_pattern:
+            return 0
+
+        end_clt = self.gens[end]
+        absorbed = 0
+        targets_of_end = set(col_idx.get(end, ()))
+
+        for index in list(col_idx.get(start, ())):
+            if index == end or index == start:
+                continue
+            if index in targets_of_end:
+                continue  # isotopy not safe
+            m = self.diff[index, start]
+            if m == 0:
+                continue
+            # Snapshot candidates: decos whose pattern matches some entry
+            # in by_pattern, with H-power ≥ the short entry.
+            cand = []
+            for d in m.decos:
+                pat = tuple(d[1:-1])
+                if pat not in by_pattern:
+                    continue
+                short_H, short_coeff = by_pattern[pat]
+                if d[0] < short_H:
+                    continue
+                cand.append((d, short_H, short_coeff))
+            for d, short_H, short_coeff in cand:
+                excess_H = d[0] - short_H
+                if field is not None and field > 1:
+                    coeff_adj = (d[-1] * short_coeff) % field
+                else:
+                    coeff_adj = d[-1] * short_coeff
+                alg_iso = Cob.canonical_h_mor(
+                    end_clt, self.gens[index], excess_H, coeff_adj)
+                if self._cob_isotopy(end, index, alg_iso, col_idx, row_idx):
+                    absorbed += 1
+        return absorbed
+
+    def _cob_cross_idem_probe(self, start, end, col_idx, row_idx, max_h=2, max_dots=1):
+        """Step B of OPEN_QUESTIONS item 5: cross-idempotent absorption.
+
+        For each ``index ∈ col_idx[start]`` (with ``index ≠ end``, ``≠ start``,
+        and ``diff[index, end] == 0`` for isotopy safety), enumerate a
+        bounded family of canonical single-decoration cobordisms from
+        ``gens[end]`` to ``gens[index]`` and try each as an isotopy
+        label.  The entropy guard in :meth:`_cob_isotopy` rejects any
+        label whose application would increase total decoration count,
+        so non-productive candidates cost only the composition evaluation.
+
+        Enumeration bounds:
+          - H-powers ``0 .. max_h``
+          - Dot subsets of size ``0 .. max_dots`` (over components of
+            the specific ``gens[end] → gens[index]`` cobordism).
+          - Coefficient ``1`` (we only try the unit case; signed
+            coefficients fall out of the arithmetic).
+
+        Returns the number of committed absorptions.
+        """
+        if self.diff[end, start] == 0:
+            return 0
+        field = Cob.get_field()
+        committed = 0
+        targets_of_end = set(col_idx.get(end, ()))
+        end_clt = self.gens[end]
+        for index in list(col_idx.get(start, ())):
+            if index == end or index == start:
+                continue
+            if index in targets_of_end:
+                continue
+            if self.diff[index, start] == 0:
+                continue
+            # Enumerate candidate alg_iso: end → index.
+            index_clt = self.gens[index]
+            comps = Cob.components(end_clt, index_clt)
+            n_comp = len(comps)
+            from itertools import combinations
+            for h in range(max_h + 1):
+                for dot_size in range(max_dots + 1):
+                    for dot_subset in combinations(range(n_comp), dot_size):
+                        alg_iso = Cob.canonical_dotted_mor(
+                            end_clt, index_clt, h, dot_subset, 1)
+                        if self._cob_isotopy(end, index, alg_iso, col_idx, row_idx):
+                            committed += 1
+                            # After a successful isotopy, diff[index, start]
+                            # changes — break out to revisit candidates.
+                            if self.diff[index, start] == 0:
+                                break
+                    else:
+                        continue
+                    break
+                else:
+                    continue
+                break
+        return committed
+
+    def clean_up_once(self, verbose=False, cross_idem=False):
+        """One pass of Cob-level arrow-shortening (OPEN_QUESTIONS item 5).
+
+        Step A (always on): same-face absorption via
+        :meth:`_cob_isolate_h_arrow`.  Polynomial-in-H reduction within
+        a fixed dot pattern.
+
+        Step B (``cross_idem=True``): additionally, try a bounded set of
+        canonical cross-idempotent cobordisms via
+        :meth:`_cob_cross_idem_probe`.  This is the experimental
+        generalization for item 5's cross-idempotent case; expensive,
+        and the entropy guard filters non-productive candidates.
+
+        Returns total absorptions committed.
+        """
+        candidates = [(s, t) for (t, s) in self._nnz if s != t]
+        if not candidates:
+            return 0
+        col_idx = self._nnz_by_col()
+        row_idx = self._nnz_by_row()
+        count = 0
+        for (start, end) in candidates:
+            count += self._cob_isolate_h_arrow(start, end, col_idx, row_idx)
+        if cross_idem:
+            col_idx = self._nnz_by_col()
+            row_idx = self._nnz_by_row()
+            candidates_b = [(s, t) for (t, s) in self._nnz if s != t]
+            for (start, end) in candidates_b:
+                count += self._cob_cross_idem_probe(start, end, col_idx, row_idx)
+        if verbose:
+            print("  clean_up_once: {} absorptions on {} candidates (cross_idem={})".format(
+                count, len(candidates), cross_idem))
+        return count
+        return count
+
+    def clean_up(self, max_iter=50):
+        """Iterate :meth:`clean_up_once` and :meth:`eliminateAll`
+        alternately until no further reduction occurs.
+
+        Breaks the super-linear growth from wide-width tangles (e.g.,
+        TH-pattern at (1, 13)) if the main source of that growth is
+        arrows whose labels differ only by a power of H — which was
+        invisible to :meth:`eliminateAll` before.  See OPEN_QUESTIONS.md
+        item 5 for the scope of what this covers vs. the open research
+        questions (dotted / cross-idempotent shortening).
+        """
+        last = None
+        for _ in range(max_iter):
+            self.eliminateAll()
+            self.clean_up_once()
+            self.eliminateAll()
+            current = len(self.gens)
+            if current == last:
+                break
+            last = current
+        return self
+
     def shift_qhd(self,q,h,delta):
         self.gens=[clt.shift_qhd(q,h,delta) for clt in self.gens]
 
@@ -310,10 +763,8 @@ def AddCap(Complex, i, grshift = "false"):
         Furthermore, it will flip the sign on every cobordism, which is the convention used so that the differential will square to 0 when adding a crossing"""
     Newgens = [AddCapToCLT(clt, i, grshift) for clt in Complex.gens]
     N = len(Complex.gens)
-    # Sparse construction: pre-allocate a zero-filled matrix and only touch
-    # the non-zero cells.  On big slices most of the N*N entries are 0, so
-    # skipping the Python-level cell loop saves meaningful time.
     Newdiff = np.zeros((N, N), dtype=object)
+    nnz_hint = []
     for target, source in Complex._nnz:
         cob = Complex.diff[target, source]
         top_plus_i = cob.front.top + i
@@ -328,7 +779,8 @@ def AddCap(Complex, i, grshift = "false"):
         reduced = NewCob.ReduceDecorations()
         if reduced != 0:
             Newdiff[target, source] = reduced
-    return CobComplex(Newgens, Newdiff)
+            nnz_hint.append((target, source))
+    return CobComplex(Newgens, Newdiff, nnz_hint=nnz_hint)
 
 def AddCupToCLT(clt, i):
     """ Adds a cup to the clt at index i, where 0 <= i <= clt.bot -2
@@ -384,6 +836,7 @@ def AddCup(Complex, i): # TODO: reduce decorations
         return new_clts_per_gen[k]
 
     Newdiff = np.zeros((new_N, new_N), dtype=object)
+    nnz_hint = []
 
     # We only need to visit non-zero entries of the old diff.  The inner body
     # below is the original 4-branch logic, modified to *write* into the
@@ -444,9 +897,9 @@ def AddCup(Complex, i): # TODO: reduce decorations
             C1 = Cob.mor(nsc[0], ntc[0], Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
             C3 = Cob.mor(nsc[0], ntc[1], Cob.simplify_decos(newDecos3), newcomps).ReduceDecorations()
             C4 = Cob.mor(nsc[1], ntc[1], Cob.simplify_decos(newDecos4), newcomps).ReduceDecorations()
-            if C1 != 0: Newdiff[row0,     col0]     = C1
-            if C3 != 0: Newdiff[row0 + 1, col0]     = C3
-            if C4 != 0: Newdiff[row0 + 1, col0 + 1] = C4
+            if C1 != 0: Newdiff[row0,     col0]     = C1; nnz_hint.append((row0, col0))
+            if C3 != 0: Newdiff[row0 + 1, col0]     = C3; nnz_hint.append((row0 + 1, col0))
+            if C4 != 0: Newdiff[row0 + 1, col0 + 1] = C4; nnz_hint.append((row0 + 1, col0 + 1))
         elif tgt_closed:  # target closed, source open
             magic_index = -1
             for x, comp in enumerate(cob.comps):
@@ -465,8 +918,8 @@ def AddCup(Complex, i): # TODO: reduce decorations
             ntc = get_new_clts(target)
             C1 = Cob.mor(nsrc, ntc[0], Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
             C2 = Cob.mor(nsrc, ntc[1], Cob.simplify_decos(newDecos2), newcomps).ReduceDecorations()
-            if C1 != 0: Newdiff[row0,     col0] = C1
-            if C2 != 0: Newdiff[row0 + 1, col0] = C2
+            if C1 != 0: Newdiff[row0,     col0] = C1; nnz_hint.append((row0, col0))
+            if C2 != 0: Newdiff[row0 + 1, col0] = C2; nnz_hint.append((row0 + 1, col0))
         elif src_closed:  # source closed, target open
             magic_index = -1
             for x, comp in enumerate(cob.comps):
@@ -489,8 +942,8 @@ def AddCup(Complex, i): # TODO: reduce decorations
             ntgt = get_new_clts(target)[0]
             C1 = Cob.mor(nsc[0], ntgt, Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
             C2 = Cob.mor(nsc[1], ntgt, Cob.simplify_decos(newDecos2), newcomps).ReduceDecorations()
-            if C1 != 0: Newdiff[row0, col0]     = C1
-            if C2 != 0: Newdiff[row0, col0 + 1] = C2
+            if C1 != 0: Newdiff[row0, col0]     = C1; nnz_hint.append((row0, col0))
+            if C2 != 0: Newdiff[row0, col0 + 1] = C2; nnz_hint.append((row0, col0 + 1))
         else:  # both open
             magic_index = -1
             for x1, comp in enumerate(cob.comps):
@@ -551,9 +1004,9 @@ def AddCup(Complex, i): # TODO: reduce decorations
             nsrc = get_new_clts(source)[0]
             ntgt = get_new_clts(target)[0]
             C1 = Cob.mor(nsrc, ntgt, Cob.simplify_decos(newDecos1), newcomps).ReduceDecorations()
-            if C1 != 0: Newdiff[row0, col0] = C1
+            if C1 != 0: Newdiff[row0, col0] = C1; nnz_hint.append((row0, col0))
 
-    return CobComplex(newgens, Newdiff)
+    return CobComplex(newgens, Newdiff, nnz_hint=nnz_hint)
   
 def AddPosCrossing(Complex, i):
     CapCup = AddCap(AddCup(Complex, i), i, "true")
@@ -570,6 +1023,7 @@ def AddPosCrossing(Complex, i):
     # "x == y" diagonal (1 or 2 cells per x depending on whether targetclt
     # is closed).  Iterate x directly instead of the full M*N grid.
     BottomLeft = np.zeros((M, N), dtype=object)
+    bl_nnz = []  # (row, col) indices written into BottomLeft
     row_cursor = 0
     for x, targetclt in enumerate(sourcegens):
         sourceclt = sourcegens[x]  # x == y case of the original
@@ -587,16 +1041,26 @@ def AddPosCrossing(Complex, i):
             decos2 = [[0] + [0 for _ in newcomps] + [1]]
             BottomLeft[row_cursor,     x] = Cob.mor(sourceclt, newTarget1, decos1, newcomps)
             BottomLeft[row_cursor + 1, x] = Cob.mor(sourceclt, newTarget2, decos2, newcomps)
+            bl_nnz.append((row_cursor, x)); bl_nnz.append((row_cursor + 1, x))
             row_cursor += 2
         else:
             newTarget = AddCapToCLT(AddCupToCLT(targetclt, i)[0], i, "true")
             decos = [[0] + [0 for _ in Cob.components(sourceclt, newTarget)] + [1]]
             BottomLeft[row_cursor, x] = Cob.mor(sourceclt, newTarget, decos)
+            bl_nnz.append((row_cursor, x))
             row_cursor += 1
 
     Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis=1),
                               np.concatenate((BottomLeft, BottomRight), axis=1)), axis=0)
-    return CobComplex(sourcegens + targetgens, Newdiff)
+    # Assemble nnz_hint from the four blocks:
+    #   TopLeft block (N x N) at offsets (0, 0)       — nnz from Complex._nnz
+    #   TopRight (N x M)                              — all zero
+    #   BottomLeft (M x N) at offsets (N, 0)          — bl_nnz
+    #   BottomRight (M x M) at offsets (N, N)         — from CapCup._nnz
+    nnz_hint = list(Complex._nnz)
+    nnz_hint.extend((N + r, c) for (r, c) in bl_nnz)
+    nnz_hint.extend((N + t, N + s) for (t, s) in CapCup._nnz)
+    return CobComplex(sourcegens + targetgens, Newdiff, nnz_hint=nnz_hint)
 
 def grshiftclt(clt):
     return Cob.obj(clt.top, clt.bot, clt.arcs, clt.h+1, clt.q+1, clt.delta-0.5)
@@ -628,6 +1092,7 @@ def AddNegCrossing(Complex, i):
     # non-zero only where the column index (source) matches the row's
     # originating generator.  Iterate columns directly.
     BottomLeft = np.zeros((N, M), dtype=object)
+    bl_nnz = []
     col_cursor = 0
     for x, sourceclt in enumerate(Complex.gens):
         newTarget = targetgens[x]
@@ -644,18 +1109,30 @@ def AddNegCrossing(Complex, i):
             decos2 = [[0] + [0 for _ in newcomps[:magic_index]] + [1] + [0 for _ in newcomps[magic_index + 1:]] + [1]]
             BottomLeft[x, col_cursor]     = Cob.mor(newSource1, newTarget, decos1, newcomps)
             BottomLeft[x, col_cursor + 1] = Cob.mor(newSource2, newTarget, decos2, newcomps)
+            bl_nnz.append((x, col_cursor)); bl_nnz.append((x, col_cursor + 1))
             col_cursor += 2
         else:
             newSource = AddCapToCLT(AddCupToCLT(sourceclt, i)[0], i)
             decos = [[0] + [0 for _ in Cob.components(newSource, newTarget)] + [1]]
             BottomLeft[x, col_cursor] = Cob.mor(newSource, newTarget, decos)
+            bl_nnz.append((x, col_cursor))
             col_cursor += 1
 
     Newdiff = np.concatenate((np.concatenate((TopLeft, TopRight), axis=1),
                               np.concatenate((BottomLeft, BottomRight), axis=1)), axis=0)
-    return CobComplex(sourcegens + targetgens, Newdiff)
+    # Assemble nnz_hint:
+    #   TopLeft (M x M) at offset (0, 0)            — CapCup._nnz
+    #   TopRight (M x N)                            — all zero
+    #   BottomLeft (N x M) at offset (M, 0)         — bl_nnz (col_index offset 0 since BL is (N, M))
+    #     ...but BottomLeft is placed to the LEFT of BottomRight, so in the
+    #     concatenated matrix its columns start at 0. Rows offset M.
+    #   BottomRight (N x N) at offset (M, M)        — from Complex._nnz shifted
+    nnz_hint = list(CapCup._nnz)
+    nnz_hint.extend((M + r, c) for (r, c) in bl_nnz)
+    nnz_hint.extend((M + t, M + s) for (t, s) in Complex._nnz)
+    return CobComplex(sourcegens + targetgens, Newdiff, nnz_hint=nnz_hint)
 
-def BNbracket(string,pos=0,neg=0,start=1,options="unsafe",cleanup_field=None):
+def BNbracket(string,pos=0,neg=0,start=1,options="unsafe",cleanup_field=None,signed_lift=False):
     """compute the Bar-Natan bracket for tangle specified by 'string', which is a concatenation of words <type>+<index>, separated by '.' read from right to left, for each elementary tangle slice, read from top to bottom, where:
     <type> is equal to:
         'pos': positive crossing
@@ -678,6 +1155,10 @@ def BNbracket(string,pos=0,neg=0,start=1,options="unsafe",cleanup_field=None):
     total ~50x slower.  Only worth turning on for tangles with many (1,3)
     checkpoints AND a follow-up cob-level mod-p simplification (not yet
     implemented).  Pass None to disable (default).
+    The fourth optional parameter 'signed_lift' controls the coefficient
+    lift when converting back from BNComplex to Cob inside the
+    intermediate cleanup: False (default) uses [0, p); True centers on
+    (-p/2, p/2].  See OPEN_QUESTIONS.md item 1.
     E.g. 'BNbracket('cup0pos0',2)' is a (2,0)-tangle which is decomposed as a positive crossing followed by a cap.
     """
     stringlist=[[word[0:3],int(word[3:])] for word in string.split('.')]
@@ -726,7 +1207,7 @@ def BNbracket(string,pos=0,neg=0,start=1,options="unsafe",cleanup_field=None):
             before = len(cx.gens)
             BN = cx.ToBNAlgebra(cleanup_field)
             BN.clean_up()
-            cx2 = BN.ToCob()
+            cx2 = BN.ToCob(signed_lift=signed_lift)
             after = len(cx2.gens)
             # Now that ToCob has emitted integer representatives in [0, p),
             # flip Cob into F_p mode for the remaining slices so coefficients
